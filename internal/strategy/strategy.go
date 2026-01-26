@@ -38,6 +38,10 @@ const (
 	MinVolatility24h      = 0.03  // Minimum 24h volatility (3%) to avoid dead coins
 	PumpRolloverThreshold = 0.05  // 24h price change > 5% for pump bonus
 	PumpRolloverBonus     = 15    // Bonus points for pump rollover scenario
+
+	// v1.4.1: Anti-false-signal filters
+	MinSupportAgeMinutes = 15.0  // Minimum support level age (15 minutes)
+	MaxPriceGain24h      = 0.10  // Max 24h gain (10%) - don't short pumping assets
 )
 
 // Engine processes candles and generates signals
@@ -234,6 +238,16 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 				Msg("signal rejected: volatility too low (dead coin)")
 			return nil // REJECT: Asset is too stable/dead, not worth trading fees
 		}
+
+		// v1.4.1: Reject strongly pumping assets - don't short assets up >10% in 24h
+		if ticker24h.Price24hPcnt > MaxPriceGain24h {
+			log.Debug().
+				Str("symbol", symbol).
+				Float64("price_change_24h", ticker24h.Price24hPcnt*100).
+				Float64("max_allowed", MaxPriceGain24h*100).
+				Msg("signal rejected: asset pumping too hard, risky to short")
+			return nil
+		}
 	}
 
 	// 1. Calculate Relative Strength (RS)
@@ -281,6 +295,17 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	candles := buffer.LastN(buffer.Len())
 	support := DetectSupport(candles)
 	if support == nil {
+		return nil
+	}
+
+	// 6.1 v1.4.1: Check minimum support age - reject too young levels (noise)
+	supportAgeMinutes := time.Since(support.Timestamp).Minutes()
+	if supportAgeMinutes < MinSupportAgeMinutes {
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("support_age_min", supportAgeMinutes).
+			Float64("min_required", MinSupportAgeMinutes).
+			Msg("signal rejected: support level too young")
 		return nil
 	}
 
@@ -459,11 +484,13 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 		}
 	}
 
-	// Pump Rollover scoring (15 points) - v1.3.0
-	// If the coin is up > 5% in the last 24h, but we have a breakdown signal locally,
+	// Pump Rollover scoring (15 points) - v1.3.0, FIXED in v1.4.1
+	// If the coin is up > 5% in the last 24h AND current candle is red (confirms reversal),
 	// it indicates a potential reversal of a pump ("Hangover" effect). High-quality setup.
 	if ticker24h := e.ticker24hStats[currentCandle.Symbol]; ticker24h != nil {
-		if ticker24h.Price24hPcnt > PumpRolloverThreshold {
+		// Only give bonus if: 1) Asset was pumping 2) Current candle is RED (confirms reversal)
+		isCurrentCandleRed := currentCandle.Close < currentCandle.Open
+		if ticker24h.Price24hPcnt > PumpRolloverThreshold && isCurrentCandleRed {
 			score += PumpRolloverBonus
 		}
 	}
