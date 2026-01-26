@@ -1,10 +1,8 @@
 .git
-.gitignore
 .env
 .env.local
-README.md
-*.md
 .DS_Store
 .vscode
 .idea
 *.log
+bot
