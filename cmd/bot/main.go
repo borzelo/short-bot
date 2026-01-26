@@ -27,7 +27,7 @@ const (
 func main() {
 	setupLogger()
 
-	log.Info().Msg("🚀 Starting Millionaire Bot v1.4.1")
+	log.Info().Msg("🚀 Starting Millionaire Bot v1.5.1")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -216,7 +216,7 @@ func processSignals(ctx context.Context, engine *strategy.Engine, store *db.Stor
 func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTickerData func(), updateWeaknessScores func()) {
 	statsTicker := time.NewTicker(5 * time.Minute)
 	tickerDataTicker := time.NewTicker(5 * time.Minute)
-	weaknessTicker := time.NewTicker(1 * time.Hour) // v1.4.0: hourly weakness scan
+	weaknessTicker := time.NewTicker(15 * time.Minute) // v1.5.1: 15-min weakness scan (was 1h - too slow for crypto)
 	defer statsTicker.Stop()
 	defer tickerDataTicker.Stop()
 	defer weaknessTicker.Stop()

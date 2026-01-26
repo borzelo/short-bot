@@ -892,6 +892,27 @@ log.Info().Msg("👋 Bot stopped")
 
 ## История изменений
 
+### v1.5.1 (26 января 2026) — Faster Weakness Scanner
+
+**Проблема:** WeaknessScanner обновлялся раз в час. В крипте за час монета может упасть на 20% и отскочить — слишком медленно.
+
+**Решение:** Интервал уменьшен с 1 часа до 15 минут.
+
+```go
+// Было:
+weaknessTicker := time.NewTicker(1 * time.Hour)
+
+// Стало:
+weaknessTicker := time.NewTicker(15 * time.Minute)
+```
+
+**Влияние на API:**
+- 1 запрос каждые 15 минут — минимальная нагрузка
+- Список "жертв" всегда актуален
+- Быстрее реагируем на изменения рынка
+
+---
+
 ### v1.5.0 (26 января 2026) — Smart Filters & OI Divergence
 
 **Цель:** Внедрение микроструктурных фильтров для повышения WinRate.
@@ -1022,33 +1043,6 @@ Meta: map[string]interface{}{
 - **Early Exit**: OI Long Exit блокирует сигнал до дорогих операций
 - **Backwards Compatibility**: Сохранена legacy scoring функция
 
-**9. Исправления и оптимизации (Code Review)**
-
-| Тип | Проблема | Исправление |
-|-----|----------|-------------|
-| **CRITICAL** | OI Divergence не работал — snapshot обновлялся ДО сравнения | Snapshot обновляется в `calculateOIDivergence()` ПОСЛЕ сравнения |
-| **Memory Leak** | `oiSnapshots` map не очищался от неактивных символов | Добавлен cleanup в `UpdateTicker24hStats()` |
-| **Edge Case** | `DistanceFromHigh()` возвращал отрицательное значение | Добавлена проверка: если `currentPrice >= high24h` → return 0 |
-| **Performance** | `calculateVolumeZScore()` аллоцировал slice каждый вызов | Расчёт напрямую из RingBuffer без аллокации |
-
-**Исправленная логика OI Divergence:**
-```
-1. UpdateTicker24hStats() — только СОЗДАЁТ новые snapshots (для новых символов)
-2. calculateOIDivergence() — СРАВНИВАЕТ текущий OI со snapshot
-3. calculateOIDivergence() — ОБНОВЛЯЕТ snapshot ПОСЛЕ сравнения
-4. Это гарантирует 15+ минутное окно между измерениями
-```
-
-**Защита от Memory Leak:**
-```go
-// В UpdateTicker24hStats():
-// Удаляем snapshots для символов, которые больше не отслеживаются
-for symbol := range e.oiSnapshots {
-    if _, active := activeSymbols[symbol]; !active {
-        delete(e.oiSnapshots, symbol)
-    }
-}
-```
 
 ---
 
@@ -1113,7 +1107,7 @@ for symbol := range e.oiSnapshots {
 
 **Изменения в архитектуре:**
 - Отбор символов: mid-cap по объёму → топ-50 слабых по WeaknessScore
-- Периодическое обновление WeaknessScore каждый час
+- Периодическое обновление WeaknessScore каждые 15 минут (v1.5.1)
 - Support detection с приоритетом консолидации
 
 ### v1.4.1 (26 января 2026) — Hotfix: Anti-False-Signal Filters
@@ -1189,5 +1183,5 @@ MaxPriceGain24h      = 0.10  // Макс. рост за 24ч для шорта
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.5.0
+**Версия бота**: 1.5.1
 **Автор архитектуры**: AI-assisted development
