@@ -22,14 +22,16 @@ type Engine struct {
 	mu          sync.RWMutex
 	candleCache map[string][]models.Candle // symbol -> ring buffer of candles
 	btcCandles  []models.Candle            // BTC candles for RS calculation
+	fundingRates map[string]float64        // symbol -> funding rate (percent)
 	signalChan  chan *models.Signal
 }
 
 func NewEngine() *Engine {
 	return &Engine{
-		candleCache: make(map[string][]models.Candle),
-		btcCandles:  make([]models.Candle, 0),
-		signalChan:  make(chan *models.Signal, 100),
+		candleCache:  make(map[string][]models.Candle),
+		btcCandles:   make([]models.Candle, 0),
+		fundingRates: make(map[string]float64),
+		signalChan:   make(chan *models.Signal, 100),
 	}
 }
 
@@ -116,18 +118,34 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// 2. Detect support level
+	// 2. Check funding rate (anti-squeeze)
+	fundingRate := e.fundingRates[symbol]
+	if fundingRate < -0.015 {
+		return nil
+	}
+
+	// 3. Detect support level
 	support := e.detectSupport(candles)
 	if support == nil {
 		return nil
 	}
 
-	// 3. Check breakdown condition: Close < Support
+	// 4. Check breakdown condition: Close < Support
 	if currentCandle.Close >= support.Price {
 		return nil
 	}
 
-	// 4. Calculate average volume
+	// 5. Confirm no buyback wick (close in bottom 30%)
+	candleRange := currentCandle.High - currentCandle.Low
+	if candleRange <= 0 {
+		return nil
+	}
+	closePosition := (currentCandle.Close - currentCandle.Low) / candleRange
+	if closePosition > 0.3 {
+		return nil
+	}
+
+	// 6. Calculate average volume
 	avgVolume := e.calculateAvgVolume(candles)
 	if avgVolume == 0 {
 		return nil
@@ -135,13 +153,13 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	volumeRatio := currentCandle.Volume / avgVolume
 
-	// 5. Check volume condition: Volume > 1.5x average
+	// 7. Check volume condition: Volume > 1.5x average
 	if volumeRatio < 1.5 {
 		return nil
 	}
 
-	// 6. Calculate score
-	score := e.calculateScore(rs, volumeRatio, support, currentCandle)
+	// 8. Calculate score
+	score := e.calculateScore(rs, volumeRatio, support, currentCandle, fundingRate, closePosition)
 
 	// CRITICAL: Only generate signals with score >= 50 (medium probability or higher)
 	if score < 50 {
@@ -165,6 +183,8 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		ScoreTotal:      score,
 		Meta: map[string]interface{}{
 			"volume_ratio":         volumeRatio,
+			"funding_rate":         fundingRate,
+			"close_position":       closePosition,
 			"support_age_minutes":  time.Since(support.Timestamp).Minutes(),
 			"support_touch_count":  support.TouchCount,
 			"avg_volume":           avgVolume,
@@ -264,7 +284,7 @@ func (e *Engine) calculateAvgVolume(candles []models.Candle) float64 {
 	return sum / float64(len(recentCandles))
 }
 
-func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models.SupportLevel, currentCandle models.Candle) int {
+func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models.SupportLevel, currentCandle models.Candle, fundingRate float64, closePosition float64) int {
 	score := 0
 
 	// Base: 0
@@ -289,6 +309,16 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 	supportAgeMinutes := time.Since(support.Timestamp).Minutes()
 	if supportAgeMinutes > 30 {
 		score += 20
+	}
+
+	// Funding scoring (positive funding supports short breakdowns)
+	if fundingRate > 0.01 {
+		score += 20
+	}
+
+	// Close position scoring (very weak close)
+	if closePosition < 0.1 {
+		score += 10
 	}
 
 	// Trend divergence scoring: BTC Green but Coin Red
@@ -322,6 +352,16 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 
 func (e *Engine) GetSignalChannel() <-chan *models.Signal {
 	return e.signalChan
+}
+
+func (e *Engine) UpdateFundingRates(rates map[string]float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.fundingRates = make(map[string]float64, len(rates))
+	for symbol, rate := range rates {
+		e.fundingRates[symbol] = rate
+	}
 }
 
 func (e *Engine) GetStats() map[string]interface{} {

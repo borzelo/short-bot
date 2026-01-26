@@ -44,13 +44,13 @@ func main() {
 	// Initialize ByBit API client
 	apiClient := bybit.NewAPIClient(cfg.ByBitAPIURL)
 
-	// Fetch top 100 USDT futures
+	// Fetch mid-cap USDT futures
 	assets, err := apiClient.GetTop100USDTFutures()
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to fetch top 100 USDT futures")
+		log.Fatal().Err(err).Msg("failed to fetch mid-cap USDT futures")
 	}
 
-	log.Info().Int("count", len(assets)).Msg("loaded top USDT futures")
+	log.Info().Int("count", len(assets)).Msg("loaded mid-cap USDT futures")
 
 	// Save assets to database
 	for _, asset := range assets {
@@ -81,6 +81,19 @@ func main() {
 	// Initialize strategy engine
 	engine := strategy.NewEngine()
 
+	updateFundingRates := func() {
+		rates, err := apiClient.GetFundingRates(symbols)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to fetch funding rates")
+			return
+		}
+		engine.UpdateFundingRates(rates)
+		log.Info().Int("count", len(rates)).Msg("funding rates updated")
+	}
+
+	// Fetch funding rates at startup
+	updateFundingRates()
+
 	// Initialize Telegram notifier
 	notifier := telegram.NewNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
 
@@ -106,6 +119,9 @@ func main() {
 	statsTicker := time.NewTicker(5 * time.Minute)
 	defer statsTicker.Stop()
 
+	fundingTicker := time.NewTicker(5 * time.Minute)
+	defer fundingTicker.Stop()
+
 	go func() {
 		for {
 			select {
@@ -116,6 +132,8 @@ func main() {
 				log.Info().
 					Interface("stats", stats).
 					Msg("engine statistics")
+			case <-fundingTicker.C:
+				updateFundingRates()
 			}
 		}
 	}()

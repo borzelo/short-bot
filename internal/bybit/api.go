@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/islamtagirov/millionaire-bot/internal/models"
@@ -17,17 +18,20 @@ type APIClient struct {
 	client  *http.Client
 }
 
+type tickerInfo struct {
+	Symbol       string `json:"symbol"`
+	Volume24h    string `json:"volume24h"`
+	Turnover24h  string `json:"turnover24h"`
+	LastPrice    string `json:"lastPrice"`
+	FundingRate  string `json:"fundingRate"`
+}
+
 type tickerResponse struct {
 	RetCode int    `json:"retCode"`
 	RetMsg  string `json:"retMsg"`
 	Result  struct {
 		Category string `json:"category"`
-		List     []struct {
-			Symbol        string `json:"symbol"`
-			Volume24h     string `json:"volume24h"`
-			Turnover24h   string `json:"turnover24h"`
-			LastPrice     string `json:"lastPrice"`
-		} `json:"list"`
+		List     []tickerInfo `json:"list"`
 	} `json:"result"`
 }
 
@@ -61,13 +65,13 @@ func NewAPIClient(baseURL string) *APIClient {
 }
 
 func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
-	log.Info().Msg("fetching top 100 USDT futures from ByBit")
+	log.Info().Msg("fetching mid-cap USDT futures from ByBit")
 
 	// Try to fetch from API, fallback to hardcoded list
 	symbols, err := c.fetchSymbolsFromAPI()
 	if err != nil {
 		log.Warn().Err(err).Msg("failed to fetch from API, using fallback symbol list")
-		symbols = getDefaultSymbols()
+		symbols = filterFallbackSymbols(getDefaultSymbols())
 	}
 
 	// Get instrument info
@@ -81,7 +85,70 @@ func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
 }
 
 func (c *APIClient) fetchSymbolsFromAPI() ([]string, error) {
-	// Get tickers with 24h volume
+	tickers, err := c.fetchTickersFromAPI()
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter USDT perpetuals and sort by turnover (USDT)
+	type symbolTurnover struct {
+		symbol   string
+		turnover float64
+	}
+
+	const minTurnoverUSD = 10_000_000
+
+	var turnovers []symbolTurnover
+	for _, ticker := range tickers {
+		// Only USDT perpetuals
+		if len(ticker.Symbol) < 4 || ticker.Symbol[len(ticker.Symbol)-4:] != "USDT" {
+			continue
+		}
+
+		turnover, err := strconv.ParseFloat(ticker.Turnover24h, 64)
+		if err != nil {
+			continue
+		}
+		if turnover < minTurnoverUSD {
+			continue
+		}
+
+		turnovers = append(turnovers, symbolTurnover{
+			symbol:   ticker.Symbol,
+			turnover: turnover,
+		})
+	}
+
+	// Sort by turnover descending
+	sort.Slice(turnovers, func(i, j int) bool {
+		return turnovers[i].turnover > turnovers[j].turnover
+	})
+
+	const excludeTop = 15
+	if len(turnovers) <= excludeTop {
+		return nil, fmt.Errorf("not enough symbols after excluding top %d", excludeTop)
+	}
+
+	start := excludeTop
+	end := start + 100
+	if len(turnovers) < end {
+		end = len(turnovers)
+	}
+
+	selected := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		selected = append(selected, turnovers[i].symbol)
+	}
+
+	log.Info().
+		Int("count", len(selected)).
+		Int("excluded", excludeTop).
+		Msg("filtered mid-cap USDT futures from API")
+	return selected, nil
+}
+
+func (c *APIClient) fetchTickersFromAPI() ([]tickerInfo, error) {
+	// Get tickers with 24h data
 	tickerURL := fmt.Sprintf("%s/v5/market/tickers?category=linear", c.baseURL)
 
 	// Create request with headers
@@ -122,44 +189,37 @@ func (c *APIClient) fetchSymbolsFromAPI() ([]string, error) {
 		return nil, fmt.Errorf("bybit api error: %s", tickerResp.RetMsg)
 	}
 
-	// Filter USDT perpetuals and sort by volume
-	type symbolVolume struct {
-		symbol string
-		volume float64
+	return tickerResp.Result.List, nil
+}
+
+func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error) {
+	tickers, err := c.fetchTickersFromAPI()
+	if err != nil {
+		return nil, err
 	}
 
-	var volumes []symbolVolume
-	for _, ticker := range tickerResp.Result.List {
-		// Only USDT perpetuals
-		if len(ticker.Symbol) < 4 || ticker.Symbol[len(ticker.Symbol)-4:] != "USDT" {
+	symbolSet := make(map[string]struct{}, len(symbols))
+	for _, symbol := range symbols {
+		symbolSet[symbol] = struct{}{}
+	}
+
+	rates := make(map[string]float64, len(symbolSet))
+	for _, ticker := range tickers {
+		if _, ok := symbolSet[ticker.Symbol]; !ok {
 			continue
 		}
-
-		var vol float64
-		fmt.Sscanf(ticker.Volume24h, "%f", &vol)
-		volumes = append(volumes, symbolVolume{
-			symbol: ticker.Symbol,
-			volume: vol,
-		})
+		if ticker.FundingRate == "" {
+			continue
+		}
+		rate, err := strconv.ParseFloat(ticker.FundingRate, 64)
+		if err != nil {
+			continue
+		}
+		// Convert to percent for strategy thresholds (e.g., 0.01% => 0.01)
+		rates[ticker.Symbol] = rate * 100
 	}
 
-	// Sort by volume descending
-	sort.Slice(volumes, func(i, j int) bool {
-		return volumes[i].volume > volumes[j].volume
-	})
-
-	// Take top 100
-	top100Count := 100
-	if len(volumes) < top100Count {
-		top100Count = len(volumes)
-	}
-	top100Symbols := make([]string, top100Count)
-	for i := 0; i < top100Count; i++ {
-		top100Symbols[i] = volumes[i].symbol
-	}
-
-	log.Info().Int("count", len(top100Symbols)).Msg("filtered top USDT futures from API")
-	return top100Symbols, nil
+	return rates, nil
 }
 
 // getDefaultSymbols returns a hardcoded list of popular USDT perpetuals
@@ -186,6 +246,39 @@ func getDefaultSymbols() []string {
 		"RLCUSDT", "RSRUSDT", "LRCUSDT", "BANDUSDT", "NMRUSDT",
 		"OGNUSDT", "STORJUSDT", "KNCUSDT", "BELUSDT", "CTKUSDT",
 	}
+}
+
+func filterFallbackSymbols(symbols []string) []string {
+	heavyweights := map[string]struct{}{
+		"BTCUSDT":  {},
+		"ETHUSDT":  {},
+		"SOLUSDT":  {},
+		"BNBUSDT":  {},
+		"XRPUSDT":  {},
+		"DOGEUSDT": {},
+		"ADAUSDT":  {},
+		"TRXUSDT":  {},
+		"MATICUSDT": {},
+		"DOTUSDT":  {},
+		"LINKUSDT": {},
+		"AVAXUSDT": {},
+		"SHIBUSDT": {},
+		"LTCUSDT":  {},
+		"BCHUSDT":  {},
+	}
+
+	filtered := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		if _, isHeavy := heavyweights[symbol]; isHeavy {
+			continue
+		}
+		filtered = append(filtered, symbol)
+	}
+
+	if len(filtered) > 100 {
+		return filtered[:100]
+	}
+	return filtered
 }
 
 func (c *APIClient) getInstrumentInfo(symbols []string) ([]models.Asset, error) {
