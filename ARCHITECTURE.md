@@ -892,6 +892,166 @@ log.Info().Msg("👋 Bot stopped")
 
 ## История изменений
 
+### v1.5.0 (26 января 2026) — Smart Filters & OI Divergence
+
+**Цель:** Внедрение микроструктурных фильтров для повышения WinRate.
+
+**1. Open Interest Divergence Analysis**
+
+Новая система анализа открытого интереса для фильтрации ложных сигналов:
+
+| Сценарий | Условие | Действие |
+|----------|---------|----------|
+| **Aggressive Short** | Price ↓ + OI ↑ (>2%) | +15 баллов (новые шорты входят) |
+| **Long Exit** | Price ↓ + OI ↓ (>2%) | **BLOCK** (лонги выходят, не шорт-сигнал) |
+
+**Реализация:**
+- ✅ `OpenInterest` добавлен в `Ticker24hStats` (models.go)
+- ✅ `OISnapshot` — структура для хранения исторических значений OI
+- ✅ `oiSnapshots` map в Engine для отслеживания OI 15 минут назад
+- ✅ `calculateOIDivergence()` — расчёт deltaOI и определение типа движения
+
+**Константы:**
+```go
+OISnapshotAgeMinutes  = 15.0   // Возраст snapshot для delta
+OIDivergenceThreshold = 0.02  // 2% порог изменения OI
+OIAggressiveShortBonus = 15   // Бонус за aggressive short
+OILongExitPenalty     = -50   // Блокировка при long exit
+```
+
+**2. Volume Z-Score Analysis**
+
+Замена грубого Volume Ratio на статистически корректный Z-Score:
+
+| Z-Score | Интерпретация | Действие |
+|---------|---------------|----------|
+| > 3.0 | Сильная аномалия | +10 баллов |
+| 2.0-3.0 | Умеренная аномалия | Используется ratio scoring |
+| < 2.0 | Нормальный объём | Используется ratio scoring |
+
+**Реализация:**
+- ✅ `internal/utils/math.go` — пакет математических функций (StdDev, Mean, ZScore)
+- ✅ `CalculateVolumeZScore()` — расчёт Z-Score для объёма
+- ✅ `calculateVolumeZScore()` в Engine — использует последние 24 свечи
+
+**Формула:**
+```
+Z-Score = (CurrentVolume - Mean) / StdDev
+```
+
+**3. Smart Pump Filter**
+
+Замена жёсткого фильтра `MaxPriceGain24h = 10%` на интеллектуальную систему:
+
+| Условие | Действие |
+|---------|----------|
+| Price24hPcnt > 30% | **BLOCK** (слишком сильный памп) |
+| Price24hPcnt > 15% && DistFromHigh < 3% | **BLOCK** (ловля падающего ножа) |
+| Price24hPcnt > 15% && DistFromHigh > 5% && Z-Score > 3.0 | +20 баллов (подтверждённый разворот пампа) |
+
+**Новые константы:**
+```go
+MaxPriceGain24h       = 0.30  // Увеличено с 0.10 до 0.30 (30%)
+SmartPumpThreshold    = 0.15  // 15% триггер smart filter
+SmartPumpNearHighDist = 0.03  // 3% от хая = ещё близко (BLOCK)
+SmartPumpRolloverDist = 0.05  // 5% от хая = подтверждённый откат
+SmartPumpRolloverBonus = 20   // Бонус за smart rollover
+```
+
+**Логика DistanceFromHigh:**
+```go
+DistFromHigh = (High24h - CurrentPrice) / High24h
+```
+
+**4. Обновлённая таблица скоринга**
+
+| Фактор | Условие | Баллы |
+|--------|---------|-------|
+| **Слабость** | RS < -3% | +30 |
+| | RS < -5% | +10 (бонус) |
+| **Объём (ratio)** | Volume >= 1.5x | +10 |
+| | Volume >= 2x | +10 |
+| | Volume >= 3x | +10 (бонус) |
+| **Объём (Z-Score)** | Z-Score > 3.0 | +10 (v1.5.0) |
+| **Возраст уровня** | Age > 20 min | +20 |
+| **Дивергенция с BTC** | BTC↑ Asset↓ | +10 |
+| **Funding** | Funding > 0.01% | +20 |
+| **Close Position** | Close < 10% свечи | +10 |
+| **OI Divergence** | Price↓ + OI↑ (>2%) | +15 (v1.5.0) |
+| **Smart Pump Rollover** | Pump>15%, Dist>5%, Z>3 | +20 (v1.5.0) |
+| **Legacy Pump Rollover** | Pump>5%, Red candle | +10 (reduced) |
+| **Support Touches** | >= 3 касания | +15 |
+| | >= 2 касания | +10 |
+| **Consolidation Break** | IsConsolidation=true | +10 |
+| | | |
+| **Максимум** | | **100 (cap)** |
+
+**5. Новые поля в Signal.Meta**
+
+```go
+Meta: map[string]interface{}{
+    // Existing fields...
+    
+    // v1.5.0 metrics
+    "volume_z_score":         float64,  // Z-Score объёма
+    "volume_mean":            float64,  // Средний объём (для отладки)
+    "volume_stddev":          float64,  // StdDev объёма (для отладки)
+    "oi_delta_pct":           float64,  // Изменение OI в %
+    "is_aggressive_short":    bool,     // Price↓ + OI↑
+    "is_smart_pump_rollover": bool,     // Подтверждённый разворот пампа
+    "dist_from_high_pct":     float64,  // Расстояние от хая в %
+}
+```
+
+**6. Новые файлы**
+
+- `internal/utils/math.go` — математические функции (StdDev, Mean, ZScore, DistanceFromHigh)
+
+**7. Изменения в существующих файлах**
+
+| Файл | Изменения |
+|------|-----------|
+| `internal/models/models.go` | Добавлен `OpenInterest` в `Ticker24hStats`, новая структура `OISnapshot` |
+| `internal/bybit/api.go` | Парсинг `openInterest` из API response |
+| `internal/strategy/strategy.go` | Новые константы, `oiSnapshots` map, методы `calculateOIDivergence()`, `calculateVolumeZScore()`, `calculateScoreV150()` |
+
+**8. Архитектурные принципы**
+
+- **DRY**: Математические функции вынесены в отдельный пакет `utils`
+- **SOLID/SRP**: Каждая функция отвечает за один аспект анализа
+- **Early Exit**: OI Long Exit блокирует сигнал до дорогих операций
+- **Backwards Compatibility**: Сохранена legacy scoring функция
+
+**9. Исправления и оптимизации (Code Review)**
+
+| Тип | Проблема | Исправление |
+|-----|----------|-------------|
+| **CRITICAL** | OI Divergence не работал — snapshot обновлялся ДО сравнения | Snapshot обновляется в `calculateOIDivergence()` ПОСЛЕ сравнения |
+| **Memory Leak** | `oiSnapshots` map не очищался от неактивных символов | Добавлен cleanup в `UpdateTicker24hStats()` |
+| **Edge Case** | `DistanceFromHigh()` возвращал отрицательное значение | Добавлена проверка: если `currentPrice >= high24h` → return 0 |
+| **Performance** | `calculateVolumeZScore()` аллоцировал slice каждый вызов | Расчёт напрямую из RingBuffer без аллокации |
+
+**Исправленная логика OI Divergence:**
+```
+1. UpdateTicker24hStats() — только СОЗДАЁТ новые snapshots (для новых символов)
+2. calculateOIDivergence() — СРАВНИВАЕТ текущий OI со snapshot
+3. calculateOIDivergence() — ОБНОВЛЯЕТ snapshot ПОСЛЕ сравнения
+4. Это гарантирует 15+ минутное окно между измерениями
+```
+
+**Защита от Memory Leak:**
+```go
+// В UpdateTicker24hStats():
+// Удаляем snapshots для символов, которые больше не отслеживаются
+for symbol := range e.oiSnapshots {
+    if _, active := activeSymbols[symbol]; !active {
+        delete(e.oiSnapshots, symbol)
+    }
+}
+```
+
+---
+
 ### v1.4.0 (26 января 2026)
 
 **ФАЗА 1: Система отбора слабых активов**
@@ -1029,5 +1189,5 @@ MaxPriceGain24h      = 0.10  // Макс. рост за 24ч для шорта
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.4.0
+**Версия бота**: 1.5.0
 **Автор архитектуры**: AI-assisted development

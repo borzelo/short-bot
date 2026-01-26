@@ -63,4 +63,11 @@ type Ticker24hStats struct {
 	LowPrice24h  float64 // Lowest price in last 24h
 	Price24hPcnt float64 // 24h price change percentage (e.g., 0.05 = +5%)
 	LastPrice    float64 // Current/last price
+	OpenInterest float64 // Open Interest in contracts (v1.5.0)
+}
+
+// OISnapshot stores Open Interest snapshot for delta calculation (v1.5.0)
+type OISnapshot struct {
+	OpenInterest float64
+	Timestamp    time.Time
 }

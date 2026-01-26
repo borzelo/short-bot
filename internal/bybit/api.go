@@ -20,14 +20,16 @@ type APIClient struct {
 }
 
 type tickerInfo struct {
-	Symbol       string `json:"symbol"`
-	Volume24h    string `json:"volume24h"`
-	Turnover24h  string `json:"turnover24h"`
-	LastPrice    string `json:"lastPrice"`
-	FundingRate  string `json:"fundingRate"`
-	HighPrice24h string `json:"highPrice24h"`
-	LowPrice24h  string `json:"lowPrice24h"`
-	Price24hPcnt string `json:"price24hPcnt"`
+	Symbol            string `json:"symbol"`
+	Volume24h         string `json:"volume24h"`
+	Turnover24h       string `json:"turnover24h"`
+	LastPrice         string `json:"lastPrice"`
+	FundingRate       string `json:"fundingRate"`
+	HighPrice24h      string `json:"highPrice24h"`
+	LowPrice24h       string `json:"lowPrice24h"`
+	Price24hPcnt      string `json:"price24hPcnt"`
+	OpenInterest      string `json:"openInterest"`      // v1.5.0: OI in contracts
+	OpenInterestValue string `json:"openInterestValue"` // v1.5.0: OI in USD
 }
 
 type tickerResponse struct {
@@ -323,6 +325,7 @@ func (c *APIClient) GetTickerData(symbols []string) (*TickerData, error) {
 		lowPrice, _ := strconv.ParseFloat(ticker.LowPrice24h, 64)
 		price24hPcnt, _ := strconv.ParseFloat(ticker.Price24hPcnt, 64)
 		lastPrice, _ := strconv.ParseFloat(ticker.LastPrice, 64)
+		openInterest, _ := strconv.ParseFloat(ticker.OpenInterest, 64) // v1.5.0
 
 		// Only add if essential data is present
 		if highPrice > 0 && lowPrice > 0 && lastPrice > 0 {
@@ -332,6 +335,7 @@ func (c *APIClient) GetTickerData(symbols []string) (*TickerData, error) {
 				LowPrice24h:  lowPrice,
 				Price24hPcnt: price24hPcnt,
 				LastPrice:    lastPrice,
+				OpenInterest: openInterest, // v1.5.0
 			}
 		}
 	}

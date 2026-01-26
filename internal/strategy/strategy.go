@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/islamtagirov/millionaire-bot/internal/models"
+	"github.com/islamtagirov/millionaire-bot/internal/utils"
 	"github.com/rs/zerolog/log"
 )
 
@@ -40,19 +41,39 @@ const (
 	PumpRolloverBonus     = 15    // Bonus points for pump rollover scenario
 
 	// v1.4.1: Anti-false-signal filters
-	MinSupportAgeMinutes = 15.0  // Minimum support level age (15 minutes)
-	MaxPriceGain24h      = 0.10  // Max 24h gain (10%) - don't short pumping assets
+	MinSupportAgeMinutes = 15.0 // Minimum support level age (15 minutes)
+
+	// v1.5.0: Smart filters (replaces MaxPriceGain24h)
+	MaxPriceGain24h = 0.30 // Increased from 0.10 to 0.30 (30%) - allow more pump scenarios
+
+	// v1.5.0: Open Interest Divergence
+	OISnapshotAgeMinutes = 15.0  // How old OI snapshot should be for delta calc
+	OIDivergenceThreshold = 0.02 // 2% OI change threshold
+	OIAggressiveShortBonus = 15  // Bonus: price down + OI up (new shorts entering)
+	OILongExitPenalty     = -50  // Penalty: price down + OI down (longs exiting, not shorts)
+
+	// v1.5.0: Volume Z-Score
+	VolumeZScoreWindow    = 24   // 24 candles for Z-Score calculation (was 20 for avg)
+	VolumeZScoreThreshold = 3.0  // Z-Score threshold for anomaly bonus
+	VolumeZScoreBonus     = 10   // Bonus for volume Z-Score > 3.0
+
+	// v1.5.0: Smart Pump Filter
+	SmartPumpThreshold    = 0.15 // 15% price gain triggers smart filter
+	SmartPumpNearHighDist = 0.03 // 3% from high = still near high (BLOCK)
+	SmartPumpRolloverDist = 0.05 // 5% from high = confirmed rollover (STRONG SIGNAL)
+	SmartPumpRolloverBonus = 20  // Bonus for confirmed pump rollover with volume
 )
 
 // Engine processes candles and generates signals
 type Engine struct {
 	mu             sync.RWMutex
-	candleCache    map[string]*RingBuffer          // symbol -> ring buffer of candles
-	btcBuffer      *RingBuffer                     // BTC candles for RS calculation
-	fundingRates   map[string]float64              // symbol -> funding rate (percent)
+	candleCache    map[string]*RingBuffer            // symbol -> ring buffer of candles
+	btcBuffer      *RingBuffer                       // BTC candles for RS calculation
+	fundingRates   map[string]float64                // symbol -> funding rate (percent)
 	ticker24hStats map[string]*models.Ticker24hStats // symbol -> 24h price statistics (v1.3.0)
+	oiSnapshots    map[string]*models.OISnapshot     // v1.5.0: symbol -> OI snapshot for delta calc
 	signalChan     chan *models.Signal
-	lastSignal     map[string]time.Time            // symbol -> last signal time (cooldown)
+	lastSignal     map[string]time.Time              // symbol -> last signal time (cooldown)
 }
 
 // RingBuffer is a memory-efficient circular buffer for candles
@@ -135,6 +156,7 @@ func NewEngine() *Engine {
 		btcBuffer:      NewRingBuffer(MaxCandlesInMemory),
 		fundingRates:   make(map[string]float64),
 		ticker24hStats: make(map[string]*models.Ticker24hStats),
+		oiSnapshots:    make(map[string]*models.OISnapshot), // v1.5.0
 		signalChan:     make(chan *models.Signal, 100),
 		lastSignal:     make(map[string]time.Time),
 	}
@@ -239,15 +261,41 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 			return nil // REJECT: Asset is too stable/dead, not worth trading fees
 		}
 
-		// v1.4.1: Reject strongly pumping assets - don't short assets up >10% in 24h
+		// v1.5.0: Smart Pump Filter (replaces simple MaxPriceGain24h filter)
+		// Allow assets up to 30% gain, but apply smart filtering
 		if ticker24h.Price24hPcnt > MaxPriceGain24h {
 			log.Debug().
 				Str("symbol", symbol).
 				Float64("price_change_24h", ticker24h.Price24hPcnt*100).
 				Float64("max_allowed", MaxPriceGain24h*100).
-				Msg("signal rejected: asset pumping too hard, risky to short")
+				Msg("signal rejected: asset pumping too hard (>30%), risky to short")
 			return nil
 		}
+
+		// v1.5.0: Smart Pump Filter - if pump > 15%, check distance from high
+		if ticker24h.Price24hPcnt > SmartPumpThreshold && ticker24h.HighPrice24h > 0 {
+			distFromHigh := utils.DistanceFromHigh(currentCandle.Close, ticker24h.HighPrice24h)
+
+			// BLOCK: If pump > 15% AND price still near high (< 3% drop) - knife catching
+			if distFromHigh < SmartPumpNearHighDist {
+				log.Debug().
+					Str("symbol", symbol).
+					Float64("price_change_24h_pct", ticker24h.Price24hPcnt*100).
+					Float64("dist_from_high_pct", distFromHigh*100).
+					Msg("signal BLOCKED: pump > 15% but price still near high (knife catching)")
+				return nil
+			}
+		}
+	}
+
+	// v1.5.0: Calculate OI divergence early for potential block
+	deltaOI, isAggressiveShort, isLongExit := e.calculateOIDivergence(symbol, currentCandle)
+	if isLongExit {
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("delta_oi_pct", deltaOI*100).
+			Msg("signal BLOCKED: price down + OI down = long exit (not short opportunity)")
+		return nil
 	}
 
 	// 1. Calculate Relative Strength (RS)
@@ -323,8 +371,27 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// 9. Calculate score
-	score := e.calculateScore(rs, volumeRatio, support, currentCandle, fundingRate, closePosition)
+	// 9. Calculate Volume Z-Score (v1.5.0)
+	volumeZScore, meanVol, stdDevVol := e.calculateVolumeZScore(buffer, currentCandle.Volume)
+
+	// 10. Check for Smart Pump Rollover bonus eligibility (v1.5.0)
+	isSmartPumpRollover := false
+	distFromHigh := 0.0
+	if ticker24h != nil && ticker24h.HighPrice24h > 0 {
+		distFromHigh = utils.DistanceFromHigh(currentCandle.Close, ticker24h.HighPrice24h)
+		// Smart Pump Rollover: pump > 15%, distance from high > 5%, Z-Score > 3.0
+		if ticker24h.Price24hPcnt > SmartPumpThreshold &&
+			distFromHigh > SmartPumpRolloverDist &&
+			volumeZScore > VolumeZScoreThreshold {
+			isSmartPumpRollover = true
+		}
+	}
+
+	// 11. Calculate score with new v1.5.0 factors
+	score := e.calculateScoreV150(
+		rs, volumeRatio, support, currentCandle, fundingRate, closePosition,
+		volumeZScore, deltaOI, isAggressiveShort, isSmartPumpRollover,
+	)
 
 	// Check minimum score threshold
 	if score < MinScoreForSignal {
@@ -333,6 +400,8 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 			Int("score", score).
 			Float64("rs", rs).
 			Float64("volume_ratio", volumeRatio).
+			Float64("volume_z_score", volumeZScore).
+			Float64("delta_oi", deltaOI).
 			Msg("signal score too low, discarded")
 		return nil
 	}
@@ -353,6 +422,14 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 			"support_touch_count":    support.TouchCount,
 			"is_consolidation_break": support.IsConsolidation,
 			"avg_volume":             avgVolume,
+			// v1.5.0 metrics
+			"volume_z_score":       volumeZScore,
+			"volume_mean":          meanVol,
+			"volume_stddev":        stdDevVol,
+			"oi_delta_pct":         deltaOI * 100, // Store as percentage
+			"is_aggressive_short":  isAggressiveShort,
+			"is_smart_pump_rollover": isSmartPumpRollover,
+			"dist_from_high_pct":   distFromHigh * 100,
 		},
 	}
 }
@@ -517,6 +594,129 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 	return score
 }
 
+// calculateScoreV150 is the enhanced scoring function with v1.5.0 features
+// Includes: Volume Z-Score, OI Divergence, Smart Pump Rollover
+func (e *Engine) calculateScoreV150(
+	rs float64,
+	volumeRatio float64,
+	support *models.SupportLevel,
+	currentCandle models.Candle,
+	fundingRate float64,
+	closePosition float64,
+	volumeZScore float64,
+	deltaOI float64,
+	isAggressiveShort bool,
+	isSmartPumpRollover bool,
+) int {
+	score := 0
+
+	// Weakness scoring (up to 40 points)
+	if rs < RSWeakThreshold {
+		score += 30
+		if rs < RSVeryWeakThreshold {
+			score += 10
+		}
+	}
+
+	// Volume scoring (up to 30 points) - keep legacy ratio scoring
+	if volumeRatio >= VolumeMinRatio {
+		score += 10 // Base score for meeting volume threshold
+		if volumeRatio >= VolumeMediumRatio {
+			score += 10 // Additional for 2x+
+			if volumeRatio >= VolumeHighRatio {
+				score += 10 // Additional for 3x+
+			}
+		}
+	}
+
+	// v1.5.0: Volume Z-Score bonus (10 points)
+	// Statistical anomaly detection - more precise than simple ratio
+	if volumeZScore > VolumeZScoreThreshold {
+		score += VolumeZScoreBonus
+	}
+
+	// Level Age scoring (20 points)
+	supportAgeMinutes := time.Since(support.Timestamp).Minutes()
+	if supportAgeMinutes > SupportAgeBonus {
+		score += 20
+	}
+
+	// Funding scoring (20 points) - positive funding supports short breakdowns
+	if fundingRate > FundingPositive {
+		score += 20
+	}
+
+	// Close position scoring (10 points) - very weak close
+	if closePosition < ClosePositionStrong {
+		score += 10
+	}
+
+	// Trend divergence scoring (10 points): BTC green but asset red
+	if e.btcBuffer.Len() >= 2 {
+		btcPrevClose := e.btcBuffer.Get(e.btcBuffer.Len() - 2).Close
+		btcCurrentClose := e.btcBuffer.Last().Close
+
+		if btcPrevClose > 0 {
+			btcChange := ((btcCurrentClose - btcPrevClose) / btcPrevClose) * 100
+
+			buffer := e.candleCache[currentCandle.Symbol]
+			if buffer != nil && buffer.Len() >= 2 {
+				assetPrevClose := buffer.Get(buffer.Len() - 2).Close
+				if assetPrevClose > 0 {
+					assetChange := ((currentCandle.Close - assetPrevClose) / assetPrevClose) * 100
+
+					// BTC is green (>0%) but asset is red (<0%)
+					if btcChange > 0 && assetChange < 0 {
+						score += 10
+					}
+				}
+			}
+		}
+	}
+
+	// v1.5.0: OI Divergence scoring
+	// Aggressive short: price down + OI up = new shorts entering (bullish for short position)
+	if isAggressiveShort {
+		score += OIAggressiveShortBonus
+	}
+
+	// v1.5.0: Smart Pump Rollover (replaces old Pump Rollover)
+	// Pump > 15%, distance from high > 5%, Z-Score > 3.0 = confirmed reversal
+	if isSmartPumpRollover {
+		score += SmartPumpRolloverBonus
+	} else {
+		// Fallback to legacy Pump Rollover logic for non-pump scenarios
+		if ticker24h := e.ticker24hStats[currentCandle.Symbol]; ticker24h != nil {
+			isCurrentCandleRed := currentCandle.Close < currentCandle.Open
+			if ticker24h.Price24hPcnt > PumpRolloverThreshold && isCurrentCandleRed {
+				// Only give smaller bonus if not already qualified for smart pump rollover
+				score += 10 // Reduced from 15 to 10 for legacy pump rollover
+			}
+		}
+	}
+
+	// Support touch count bonus (up to 15 points) - v1.4.0
+	// Multiple touches of support level = stronger level
+	if support.TouchCount >= 3 {
+		score += 15
+	} else if support.TouchCount >= 2 {
+		score += 10
+	}
+
+	// Consolidation breakout bonus (10 points) - v1.4.0
+	// Consolidation breakdowns are stronger than simple fractal low breakdowns
+	if support.IsConsolidation {
+		score += 10
+	}
+
+	// Cap at 100
+	if score > 100 {
+		score = 100
+	}
+
+	return score
+}
+
 func (e *Engine) GetSignalChannel() <-chan *models.Signal {
 	return e.signalChan
 }
@@ -532,16 +732,140 @@ func (e *Engine) UpdateFundingRates(rates map[string]float64) {
 }
 
 // UpdateTicker24hStats updates 24h price statistics for volatility filter and pump detection (v1.3.0)
+// v1.5.0: Also initializes OI snapshots for divergence analysis
 func (e *Engine) UpdateTicker24hStats(stats map[string]*models.Ticker24hStats) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	now := time.Now()
+
+	// Track which symbols are still active (for cleanup)
+	activeSymbols := make(map[string]struct{}, len(stats))
+
+	// Update ticker stats
 	e.ticker24hStats = make(map[string]*models.Ticker24hStats, len(stats))
 	for symbol, stat := range stats {
 		e.ticker24hStats[symbol] = stat
+		activeSymbols[symbol] = struct{}{}
+
+		// v1.5.0: Initialize OI snapshots for new symbols only
+		// The actual snapshot UPDATE happens in calculateOIDivergence AFTER comparison
+		// This ensures we always compare current OI against 15+ minute old baseline
+		if stat.OpenInterest > 0 {
+			if _, exists := e.oiSnapshots[symbol]; !exists {
+				// First time seeing this symbol - create baseline snapshot
+				e.oiSnapshots[symbol] = &models.OISnapshot{
+					OpenInterest: stat.OpenInterest,
+					Timestamp:    now,
+				}
+			}
+			// Existing snapshots are updated in calculateOIDivergence after comparison
+		}
 	}
 
-	log.Debug().Int("count", len(stats)).Msg("ticker 24h stats updated")
+	// v1.5.0: Cleanup old snapshots for symbols no longer tracked (prevent memory leak)
+	for symbol := range e.oiSnapshots {
+		if _, active := activeSymbols[symbol]; !active {
+			delete(e.oiSnapshots, symbol)
+		}
+	}
+
+	log.Debug().
+		Int("stats_count", len(stats)).
+		Int("oi_snapshots", len(e.oiSnapshots)).
+		Msg("ticker 24h stats and OI snapshots updated")
+}
+
+// calculateOIDivergence calculates Open Interest divergence (v1.5.0)
+// Returns: deltaOI (percentage change), isAggressiveShort (OI up while price down), isLongExit (OI down while price down)
+// IMPORTANT: This function updates the snapshot AFTER comparison to ensure proper timing
+func (e *Engine) calculateOIDivergence(symbol string, currentCandle models.Candle) (deltaOI float64, isAggressiveShort bool, isLongExit bool) {
+	ticker := e.ticker24hStats[symbol]
+	snapshot := e.oiSnapshots[symbol]
+
+	// Need both current OI and historical snapshot
+	if ticker == nil || snapshot == nil || ticker.OpenInterest <= 0 || snapshot.OpenInterest <= 0 {
+		return 0, false, false
+	}
+
+	snapshotAge := time.Since(snapshot.Timestamp).Minutes()
+
+	// Check if snapshot is old enough for meaningful delta
+	if snapshotAge < OISnapshotAgeMinutes {
+		return 0, false, false
+	}
+
+	// Calculate OI change: compare CURRENT OI (from ticker) with HISTORICAL OI (from snapshot)
+	deltaOI = (ticker.OpenInterest - snapshot.OpenInterest) / snapshot.OpenInterest
+
+	// Update snapshot AFTER comparison (critical for correct timing)
+	// This ensures we always compare against 15+ minute old data
+	e.oiSnapshots[symbol] = &models.OISnapshot{
+		OpenInterest: ticker.OpenInterest,
+		Timestamp:    time.Now(),
+	}
+
+	// Check if current candle is bearish (price going down)
+	isPriceDown := currentCandle.Close < currentCandle.Open
+
+	if isPriceDown {
+		if deltaOI > OIDivergenceThreshold {
+			// Price down + OI up = New shorts entering = Aggressive short signal
+			isAggressiveShort = true
+		} else if deltaOI < -OIDivergenceThreshold {
+			// Price down + OI down = Longs exiting = Not a short opportunity (squeeze risk)
+			isLongExit = true
+		}
+	}
+
+	return deltaOI, isAggressiveShort, isLongExit
+}
+
+// calculateVolumeZScore calculates Volume Z-Score using utils package (v1.5.0)
+// Optimized: reuses pre-allocated slice to reduce GC pressure
+func (e *Engine) calculateVolumeZScore(buffer *RingBuffer, currentVolume float64) (zScore float64, meanVol float64, stdDevVol float64) {
+	// Need at least 3 candles: 2 for history + 1 current
+	if buffer.Len() < 3 {
+		return 0, 0, 0
+	}
+
+	window := VolumeZScoreWindow
+	if buffer.Len() < window {
+		window = buffer.Len()
+	}
+
+	// Calculate mean and stddev directly from buffer to avoid slice allocation
+	// We exclude the last candle (current) from historical data
+	historyLen := window - 1
+	if historyLen < 2 {
+		return 0, 0, 0
+	}
+
+	// Calculate mean directly from ring buffer
+	var sum float64
+	startIdx := buffer.Len() - window
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	for i := startIdx; i < buffer.Len()-1; i++ { // Exclude last (current) candle
+		sum += buffer.Get(i).Volume
+	}
+	meanVol = sum / float64(historyLen)
+
+	// Calculate stddev
+	var sumSquares float64
+	for i := startIdx; i < buffer.Len()-1; i++ {
+		diff := buffer.Get(i).Volume - meanVol
+		sumSquares += diff * diff
+	}
+	stdDevVol = math.Sqrt(sumSquares / float64(historyLen-1)) // Sample stddev
+
+	if stdDevVol == 0 {
+		return 0, meanVol, 0
+	}
+
+	zScore = (currentVolume - meanVol) / stdDevVol
+	return zScore, meanVol, stdDevVol
 }
 
 func (e *Engine) GetStats() map[string]interface{} {
