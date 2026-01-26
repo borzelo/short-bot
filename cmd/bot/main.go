@@ -42,7 +42,7 @@ func main() {
 	defer store.Close()
 
 	// Initialize ByBit API client
-	apiClient := bybit.NewAPIClient(cfg.ByBitAPIURL)
+	apiClient := bybit.NewAPIClient(cfg.ByBitAPIURL, cfg.ByBitAPIAltURL)
 
 	// Fetch mid-cap USDT futures
 	assets, err := apiClient.GetTop100USDTFutures()
@@ -82,13 +82,10 @@ func main() {
 	engine := strategy.NewEngine()
 
 	updateFundingRates := func() {
-		rates, err := apiClient.GetFundingRates(symbols)
-		if err != nil {
-			log.Warn().Err(err).Msg("failed to fetch funding rates")
-			return
-		}
+		rates, _ := apiClient.GetFundingRates(symbols)
+		// GetFundingRates now always returns rates (with fallback to 0)
+		// so we just update the engine
 		engine.UpdateFundingRates(rates)
-		log.Info().Int("count", len(rates)).Msg("funding rates updated")
 	}
 
 	// Fetch funding rates at startup

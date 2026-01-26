@@ -11,6 +11,7 @@ type Config struct {
 	DatabaseURL      string
 	ByBitWSURL       string
 	ByBitAPIURL      string
+	ByBitAPIAltURL   string
 	ByBitAPIKey      string
 	ByBitAPISecret   string
 	TelegramBotToken string
@@ -26,6 +27,7 @@ func Load() (*Config, error) {
 		DatabaseURL:      getEnv("DATABASE_URL", ""),
 		ByBitWSURL:       getEnv("BYBIT_WS_URL", "wss://stream.bybit.com/v5/public/linear"),
 		ByBitAPIURL:      getEnv("BYBIT_API_URL", "https://api.bybit.com"),
+		ByBitAPIAltURL:   getEnv("BYBIT_API_ALT_URL", ""),
 		ByBitAPIKey:      getEnv("BYBIT_API_KEY", ""),
 		ByBitAPISecret:   getEnv("BYBIT_API_SECRET", ""),
 		TelegramBotToken: getEnv("TELEGRAM_BOT_TOKEN", ""),

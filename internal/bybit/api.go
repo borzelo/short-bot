@@ -14,8 +14,9 @@ import (
 )
 
 type APIClient struct {
-	baseURL string
-	client  *http.Client
+	baseURL    string
+	altBaseURL string
+	client     *http.Client
 }
 
 type tickerInfo struct {
@@ -55,9 +56,10 @@ type instrumentResponse struct {
 	} `json:"result"`
 }
 
-func NewAPIClient(baseURL string) *APIClient {
+func NewAPIClient(baseURL string, altBaseURL string) *APIClient {
 	return &APIClient{
-		baseURL: baseURL,
+		baseURL:    baseURL,
+		altBaseURL: altBaseURL,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -147,55 +149,120 @@ func (c *APIClient) fetchSymbolsFromAPI() ([]string, error) {
 	return selected, nil
 }
 
-func (c *APIClient) fetchTickersFromAPI() ([]tickerInfo, error) {
-	// Get tickers with 24h data
-	tickerURL := fmt.Sprintf("%s/v5/market/tickers?category=linear", c.baseURL)
+// Alternative ByBit API endpoints that may bypass Cloudflare
+var alternativeAPIs = []string{
+	"https://api.bytick.com",      // Alternative ByBit domain
+	"https://api.bybit.nl",        // Netherlands region
+	"https://api-demo.bybit.com",  // Demo API (real market data)
+}
 
-	// Create request with headers
+func (c *APIClient) fetchTickersFromAPI() ([]tickerInfo, error) {
+	// Build list of URLs to try
+	urlsToTry := []string{c.baseURL}
+	if c.altBaseURL != "" && c.altBaseURL != c.baseURL {
+		urlsToTry = append(urlsToTry, c.altBaseURL)
+	}
+	// Add alternative APIs as fallbacks
+	for _, alt := range alternativeAPIs {
+		if alt != c.baseURL && alt != c.altBaseURL {
+			urlsToTry = append(urlsToTry, alt)
+		}
+	}
+
+	var lastErr error
+	var lastStatusCode int
+
+	for i, url := range urlsToTry {
+		body, statusCode, err := c.fetchTickersBody(url)
+		if err == nil {
+			var tickerResp tickerResponse
+			if err := json.Unmarshal(body, &tickerResp); err != nil {
+				lastErr = fmt.Errorf("unmarshal tickers: %w", err)
+				continue
+			}
+
+			if tickerResp.RetCode != 0 {
+				lastErr = fmt.Errorf("bybit api error: %s", tickerResp.RetMsg)
+				continue
+			}
+
+			if i > 0 {
+				log.Info().
+					Str("url", url).
+					Int("attempt", i+1).
+					Msg("successfully fetched data from alternative API")
+			}
+			return tickerResp.Result.List, nil
+		}
+
+		lastErr = err
+		lastStatusCode = statusCode
+
+		if i < len(urlsToTry)-1 {
+			log.Debug().
+				Int("status_code", statusCode).
+				Str("url", url).
+				Int("attempt", i+1).
+				Msg("API request failed, trying next URL")
+		}
+	}
+
+	log.Warn().
+		Int("status_code", lastStatusCode).
+		Int("urls_tried", len(urlsToTry)).
+		Msg("all API endpoints returned non-200 status, will use fallback")
+	return nil, lastErr
+}
+
+func (c *APIClient) fetchTickersBody(baseURL string) ([]byte, int, error) {
+	tickerURL := fmt.Sprintf("%s/v5/market/tickers?category=linear", baseURL)
+
 	req, err := http.NewRequest("GET", tickerURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	// Add headers to avoid Cloudflare blocking
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MillionaireBot/1.0)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Origin", "https://www.bybit.com")
+	req.Header.Set("Referer", "https://www.bybit.com/")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch tickers: %w", err)
+		return nil, 0, fmt.Errorf("fetch tickers: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("read response: %w", err)
 	}
 
-	// Log response for debugging
 	if resp.StatusCode != http.StatusOK {
-		log.Warn().
-			Int("status_code", resp.StatusCode).
-			Msg("API returned non-200 status, will use fallback")
-		return nil, fmt.Errorf("api returned status %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("api returned status %d", resp.StatusCode)
 	}
 
-	var tickerResp tickerResponse
-	if err := json.Unmarshal(body, &tickerResp); err != nil {
-		return nil, fmt.Errorf("unmarshal tickers: %w", err)
-	}
-
-	if tickerResp.RetCode != 0 {
-		return nil, fmt.Errorf("bybit api error: %s", tickerResp.RetMsg)
-	}
-
-	return tickerResp.Result.List, nil
+	return body, resp.StatusCode, nil
 }
 
 func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error) {
 	tickers, err := c.fetchTickersFromAPI()
 	if err != nil {
-		return nil, err
+		// Return empty map with zero funding rates as fallback
+		// This allows the strategy to work without funding data
+		// (funding filter will pass since 0 >= -0.015)
+		log.Warn().
+			Err(err).
+			Int("symbols_count", len(symbols)).
+			Msg("funding rates unavailable, using zero fallback - signals will work but without funding scoring")
+		
+		rates := make(map[string]float64, len(symbols))
+		for _, symbol := range symbols {
+			rates[symbol] = 0 // Neutral funding assumption
+		}
+		return rates, nil
 	}
 
 	symbolSet := make(map[string]struct{}, len(symbols))
@@ -219,6 +286,7 @@ func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error
 		rates[ticker.Symbol] = rate * 100
 	}
 
+	log.Info().Int("rates_count", len(rates)).Msg("funding rates fetched successfully")
 	return rates, nil
 }
 

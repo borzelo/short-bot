@@ -15,7 +15,7 @@
 
 ## Общий обзор
 
-**Millionaire Bot** - это высокопроизводительный микросервис на Go для мониторинга крипто-фьючерсов на ByBit и детектирования сигналов "пробоя слабых активов" в реальном времени.
+**Millionaire Bot** - это высокопроизводительный микросервис на Go для мониторинга крипто-фьючерсов на ByBit и детектирования сигналов "OBVAL / пробоя слабых активов" в реальном времени. Стратегия смещена в сторону волатильных mid-cap инструментов и включает защиту от "short squeeze" и "buyback".
 
 ### Архитектурная диаграмма
 
@@ -43,7 +43,9 @@
                     │  Strategy Engine │
                     │                  │
                     │ • RS Calculation │
+                    │ • Funding Filter │
                     │ • Support Detect │
+                    │ • Wick Check     │
                     │ • Volume Check   │
                     │ • Score Calc     │
                     └──────────────────┘
@@ -83,6 +85,9 @@ go handleReconnect(ctx, wsClient, symbols, wsURL)
 
 // 4. Периодическая статистика (каждые 5 минут)
 go statsLogger(ctx, engine)
+
+// 5. Обновление funding rates (каждые 5 минут)
+go fundingUpdater(ctx, apiClient, engine)
 ```
 
 ---
@@ -100,6 +105,7 @@ go statsLogger(ctx, engine)
 | `TELEGRAM_CHAT_ID` | ID чата для уведомлений | ✅ |
 | `BYBIT_WS_URL` | WebSocket URL ByBit | ❌ (по умолчанию: `wss://stream.bybit.com/v5/public/linear`) |
 | `BYBIT_API_URL` | REST API URL ByBit | ❌ (по умолчанию: `https://api.bybit.com`) |
+| `BYBIT_API_ALT_URL` | Альтернативный REST API URL ByBit (fallback при 403) | ❌ |
 | `LOG_LEVEL` | Уровень логирования | ❌ (по умолчанию: `info`) |
 
 ---
@@ -108,17 +114,19 @@ go statsLogger(ctx, engine)
 
 #### 3.1 **API Client** (`api.go`)
 
-**Роль**: Получение списка торгуемых инструментов.
+**Роль**: Получение списка торгуемых инструментов и funding rates.
 
 **Функционал**:
-- Попытка получить топ-100 USDT фьючерсов через REST API
+- Получение всех USDT Perp тикеров и сортировка по turnover 24h
+- Исключение Top-15 по объёму и выбор следующих 100 (Rank 16-116)
+- Фильтр ликвидности: turnover >= $10M/24h
+- Получение funding rates через `/v5/market/tickers`
 - Fallback на hardcoded список при 403 ошибке (Cloudflare blocking)
 - Возврат базовых параметров инструментов
 
-**Fallback список** (100 символов):
+**Fallback список** (100 символов, heavyweights исключены):
 ```go
-BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, ADAUSDT, DOGEUSDT,
-MATICUSDT, DOTUSDT, LINKUSDT, AVAXUSDT, SHIBUSDT, UNIUSDT, ...
+ETHFIUSDT, CHZUSDT, ETCUSDT, HBARUSDT, XLMUSDT, TRXUSDT, BCHUSDT, ...
 ```
 
 #### 3.2 **WebSocket Client** (`websocket.go`)
@@ -175,6 +183,7 @@ MATICUSDT, DOTUSDT, LINKUSDT, AVAXUSDT, SHIBUSDT, UNIUSDT, ...
 type Engine struct {
     candleCache map[string][]Candle  // symbol → последние 240 свечей
     btcCandles  []Candle              // BTC для расчета RS
+    fundingRates map[string]float64   // symbol → funding rate (%)
     signalChan  chan *Signal          // Канал для сигналов
 }
 ```
@@ -213,6 +222,11 @@ type Engine struct {
          │
          ▼
 ┌─────────────────┐
+│  Funding Check  │  ← Crowded short filter
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
 │  Detect         │
 │  Support Level  │  ← Fractal Low pattern
 └────────┬────────┘
@@ -221,6 +235,11 @@ type Engine struct {
 ┌─────────────────┐
 │  Check          │
 │  Breakdown      │  ← Close < Support?
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Wick Analysis  │  ← Close near bottom?
 └────────┬────────┘
          │
          ▼
@@ -251,12 +270,14 @@ type Engine struct {
 
 ## Стратегия детекции
 
-### Концепция: "Weak Asset Breakdown"
+### Концепция: "OBVAL / Weak Asset Breakdown"
 
 **Идея**: Найти активы, которые:
 1. **Слабее рынка** (падают сильнее чем BTC)
 2. **Пробили поддержку** (закрытие ниже локального минимума)
 3. **С высоким объёмом** (подтверждение продаж)
+4. **Не в crowded short** (funding rate не слишком отрицательный)
+5. **Закрылись у нижней границы свечи** (без buyback)
 
 ---
 
@@ -376,7 +397,37 @@ Current Close: $142.10  ← Пробой!
 
 ---
 
-### 4. **Volume Confirmation**
+### 4. **Funding Rate (Anti-Squeeze)**
+
+**Идея**: Слишком отрицательный funding означает переполненные шорты → высокий риск squeeze.
+
+**Триггер**:
+```
+FundingRate < -0.015%  →  сигнал отбрасывается
+```
+
+**Обновление**: funding rates обновляются каждые 5 минут.
+
+---
+
+### 5. **Wick / Close Position**
+
+**Формула**:
+```
+candleRange := High - Low
+closePosition := (Close - Low) / candleRange
+```
+
+**Триггер**:
+```
+closePosition <= 0.3  // закрытие в нижних 30%
+```
+
+**Логика**: если closePosition > 0.3, свеча имеет сильный откуп (buyback) → сигнал отбрасывается.
+
+---
+
+### 6. **Volume Confirmation**
 
 **Формула**:
 ```
@@ -493,6 +544,30 @@ if btcChange > 0 && assetChange < 0 {
 
 ---
 
+#### 5. **Funding (положительный)** (20 баллов)
+
+```go
+if fundingRate > 0.01 {
+    score += 20
+}
+```
+
+**Логика**: Положительный funding означает, что лонги платят шортам → пробой вниз устойчивее.
+
+---
+
+#### 6. **Close Position (сильный пробой)** (10 баллов)
+
+```go
+if closePosition < 0.1 {
+    score += 10
+}
+```
+
+**Логика**: Закрытие в нижних 10% свечи усиливает качество пробоя.
+
+---
+
 ### Итоговая таблица скоринга
 
 | Фактор | Условие | Баллы |
@@ -503,8 +578,10 @@ if btcChange > 0 && assetChange < 0 {
 | | Volume > 3x | +10 (бонус) |
 | **Возраст уровня** | Age > 30 min | +20 |
 | **Дивергенция** | BTC↑ Asset↓ | +10 |
+| **Funding** | Funding > 0.01% | +20 |
+| **Close Position** | Close < 10% свечи | +10 |
 | | | |
-| **Максимум** | | **100** |
+| **Максимум** | | **100 (cap)** |
 
 ---
 
@@ -597,6 +674,8 @@ CREATE INDEX idx_signals_symbol_time ON signals(symbol, created_at DESC);
   "score_total": 85,
   "meta": {
     "volume_ratio": 2.4,
+    "funding_rate": 0.012,
+    "close_position": 0.08,
     "support_age_minutes": 45.0,
     "support_touch_count": 0,
     "avg_volume": 514.4
@@ -901,7 +980,7 @@ log.Info().Msg("👋 Bot stopped")
 | | | |
 | **Latency** | <100ms | От свечи до сигнала |
 | **Memory** | ~50-100MB | 24k свечей в памяти |
-| **Symbols** | 100 USDT Perps | Топ по объёму |
+| **Symbols** | 100 USDT Perps | Mid-cap, исключая Top-15 |
 | **Warmup** | 30 минут | До первого сигнала |
 
 ---
@@ -920,5 +999,5 @@ log.Info().Msg("👋 Bot stopped")
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.0.0
+**Версия бота**: 1.1.0
 **Автор архитектуры**: AI-assisted development
