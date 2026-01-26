@@ -89,7 +89,10 @@ func (e *Engine) ProcessCandle(candle models.Candle) {
 			log.Info().
 				Str("symbol", signal.Symbol).
 				Int("score", signal.ScoreTotal).
-				Msg("signal generated")
+				Float64("rs", signal.ScoreRS).
+				Float64("price", signal.PriceTrigger).
+				Float64("support", signal.LevelBroken).
+				Msg("✅ HIGH-QUALITY SIGNAL GENERATED")
 		default:
 			log.Warn().Str("symbol", candle.Symbol).Msg("signal channel full")
 		}
@@ -106,6 +109,12 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	// 1. Calculate Relative Strength (RS)
 	rs := e.calculateRS(symbol)
+
+	// CRITICAL: Check weakness - RS must be < -3% (asset weaker than BTC)
+	if rs >= -3.0 {
+		// Not weak enough, skip analysis
+		return nil
+	}
 
 	// 2. Detect support level
 	support := e.detectSupport(candles)
@@ -133,6 +142,17 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	// 6. Calculate score
 	score := e.calculateScore(rs, volumeRatio, support, currentCandle)
+
+	// CRITICAL: Only generate signals with score >= 50 (medium probability or higher)
+	if score < 50 {
+		log.Debug().
+			Str("symbol", symbol).
+			Int("score", score).
+			Float64("rs", rs).
+			Float64("volume_ratio", volumeRatio).
+			Msg("signal score too low, discarded")
+		return nil
+	}
 
 	// Create signal
 	signal := &models.Signal{
