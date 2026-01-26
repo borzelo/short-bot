@@ -47,6 +47,7 @@
                     │ • Support Detect │
                     │ • Wick Check     │
                     │ • Volume Check   │
+                    │ • Signal Cooldown│
                     │ • Score Calc     │
                     └──────────────────┘
                               │
@@ -80,15 +81,11 @@ go processCandles(ctx, engine, wsClient)
 // 2. Обработка сигналов (БД + Telegram)
 go processSignals(ctx, engine, store, notifier)
 
-// 3. Обработка переподключений WebSocket
-go handleReconnect(ctx, wsClient, symbols, wsURL)
-
-// 4. Периодическая статистика (каждые 5 минут)
-go statsLogger(ctx, engine)
-
-// 5. Обновление funding rates (каждые 5 минут)
-go fundingUpdater(ctx, apiClient, engine)
+// 3. Периодические задачи (статистика + funding rates)
+go runPeriodicTasks(ctx, engine, updateFundingRates)
 ```
+
+> **Примечание**: Реконнект WebSocket теперь управляется внутри `WSClient` (SRP принцип).
 
 ---
 
@@ -121,17 +118,23 @@ go fundingUpdater(ctx, apiClient, engine)
 - Исключение Top-15 по объёму и выбор следующих 100 (Rank 16-116)
 - Фильтр ликвидности: turnover >= $10M/24h
 - Получение funding rates через `/v5/market/tickers`
-- Fallback на hardcoded список при 403 ошибке (Cloudflare blocking)
+- **Multi-endpoint fallback** при 403 ошибке (Cloudflare blocking)
 - Возврат базовых параметров инструментов
 
-**Fallback список** (100 символов, heavyweights исключены):
+**Альтернативные API endpoints** (автоматический перебор):
 ```go
-ETHFIUSDT, CHZUSDT, ETCUSDT, HBARUSDT, XLMUSDT, TRXUSDT, BCHUSDT, ...
+var alternativeAPIs = []string{
+    "https://api.bytick.com",      // Alternative ByBit domain
+    "https://api.bybit.nl",        // Netherlands region
+    "https://api-demo.bybit.com",  // Demo API (real market data)
+}
 ```
+
+**Fallback для funding rates**: Если все API недоступны, возвращаются нулевые значения (сигналы работают, но без funding scoring).
 
 #### 3.2 **WebSocket Client** (`websocket.go`)
 
-**Роль**: Real-time стриминг 1-минутных свечей.
+**Роль**: Real-time стриминг 1-минутных свечей с автоматическим реконнектом.
 
 **Протокол**:
 ```
@@ -139,7 +142,8 @@ ETHFIUSDT, CHZUSDT, ETCUSDT, HBARUSDT, XLMUSDT, TRXUSDT, BCHUSDT, ...
 2. Подписка на kline.1.<SYMBOL> для каждого из 100 символов
    - Батчами по 10 символов (ограничение ByBit API)
 3. Получение данных в формате JSON
-4. Парсинг и отправка в канал
+4. Валидация и парсинг свечей
+5. Отправка в канал
 ```
 
 **Структура сообщения**:
@@ -161,14 +165,36 @@ ETHFIUSDT, CHZUSDT, ETCUSDT, HBARUSDT, XLMUSDT, TRXUSDT, BCHUSDT, ...
 }
 ```
 
-**Reconnection**:
+**Self-Healing Reconnection** (внутри WSClient):
+```go
+const (
+    maxReconnectAttempts = 10
+    baseReconnectDelay   = 1 * time.Second
+    maxReconnectDelay    = 60 * time.Second
+)
+```
 - Автоматическое переподключение при разрыве соединения
-- Exponential backoff (1s, 2s, 4s, 8s, 16s)
-- Максимум 5 попыток, затем Fatal error
+- Exponential backoff с лимитом 60 секунд
+- Максимум 10 попыток, затем Fatal error
+- **Не требует внешнего handleReconnect** — соответствует SRP
+
+**Валидация свечей**:
+```go
+func validateCandle(c models.Candle) error {
+    if c.High < c.Low { return fmt.Errorf("high < low") }
+    if c.Close > c.High || c.Close < c.Low { return fmt.Errorf("close outside range") }
+    if c.Open > c.High || c.Open < c.Low { return fmt.Errorf("open outside range") }
+    if c.Volume < 0 { return fmt.Errorf("negative volume") }
+    if c.Open == 0 || c.High == 0 || c.Low == 0 || c.Close == 0 {
+        return fmt.Errorf("zero price detected")
+    }
+    return nil
+}
+```
 
 **Ping/Pong**:
 - Ping каждые 20 секунд для поддержания соединения
-- Pong handler обновляет read deadline
+- Pong handler обновляет read deadline (60 секунд)
 
 ---
 
@@ -176,26 +202,80 @@ ETHFIUSDT, CHZUSDT, ETCUSDT, HBARUSDT, XLMUSDT, TRXUSDT, BCHUSDT, ...
 
 **Роль**: Ядро системы - детекция сигналов пробоя.
 
-#### 4.1 **Data Storage**
+#### 4.1 **Конфигурационные константы**
 
-**Ring Buffer** для каждого символа:
 ```go
-type Engine struct {
-    candleCache map[string][]Candle  // symbol → последние 240 свечей
-    btcCandles  []Candle              // BTC для расчета RS
-    fundingRates map[string]float64   // symbol → funding rate (%)
-    signalChan  chan *Signal          // Канал для сигналов
+const (
+    MaxCandlesInMemory = 240 // 4 часа 1-минутных свечей
+    RSLookbackMinutes  = 60  // 1 час для расчёта RS
+    MinRSLookback      = 30  // Минимум 30 минут для старта анализа
+    SupportLookback    = 60  // 60 минут для поиска поддержки
+    VolumeAvgWindow    = 20  // 20 свечей для среднего объёма
+    SignalCooldownMins = 15  // Cooldown между сигналами по символу
+)
+```
+
+#### 4.2 **Data Storage — RingBuffer**
+
+**Проблема старой реализации**: `slice[1:]` не освобождает память underlying array → memory leak.
+
+**Решение**: Собственная реализация `RingBuffer`:
+
+```go
+type RingBuffer struct {
+    data  []models.Candle
+    size  int
+    head  int
+    count int
+}
+
+func (rb *RingBuffer) Push(c models.Candle) {
+    rb.data[rb.head] = c
+    rb.head = (rb.head + 1) % rb.size
+    if rb.count < rb.size {
+        rb.count++
+    }
 }
 ```
 
-**Лимиты памяти**:
-- Максимум **240 свечей** (4 часа) на символ
-- При достижении лимита: удаление самой старой свечи
-- ~100 символов × 240 свечей = **24,000 свечей в памяти**
+**Преимущества**:
+- ✅ Фиксированный размер массива — нет аллокаций после инициализации
+- ✅ O(1) операции Push/Get
+- ✅ Нет memory leak
 
-#### 4.2 **Processing Pipeline**
+**Структура Engine**:
+```go
+type Engine struct {
+    mu           sync.RWMutex
+    candleCache  map[string]*RingBuffer // symbol → свечи
+    btcBuffer    *RingBuffer            // BTC отдельно (не дублируется!)
+    fundingRates map[string]float64     // symbol → funding rate (%)
+    signalChan   chan *models.Signal
+    lastSignal   map[string]time.Time   // symbol → время последнего сигнала
+}
+```
 
-**Для каждой новой свечи**:
+**Важно**: BTC хранится только в `btcBuffer`, не в `candleCache` — убрано дублирование.
+
+#### 4.3 **Signal Cooldown**
+
+**Проблема**: Если актив пробил поддержку и держится ниже неё 5 минут — отправляется 5 дубликатов.
+
+**Решение**: 15-минутный cooldown между сигналами по одному символу:
+
+```go
+func (e *Engine) emitSignal(signal *models.Signal) {
+    if lastTime, exists := e.lastSignal[signal.Symbol]; exists {
+        if time.Since(lastTime).Minutes() < SignalCooldownMins {
+            return // Пропускаем дубликат
+        }
+    }
+    e.signalChan <- signal
+    e.lastSignal[signal.Symbol] = time.Now()
+}
+```
+
+#### 4.4 **Processing Pipeline**
 
 ```
 ┌─────────────────┐
@@ -205,8 +285,14 @@ type Engine struct {
          │
          ▼
 ┌─────────────────┐
+│  Validate       │  ← High >= Low? Close in range?
+│  Candle         │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
 │  Store in       │
-│  Ring Buffer    │
+│  RingBuffer     │  ← Memory-efficient circular buffer
 └────────┬────────┘
          │
          ▼
@@ -217,7 +303,7 @@ type Engine struct {
          │
          ▼
 ┌─────────────────┐
-│  Calculate RS   │  ← Relative Strength vs BTC
+│  Calculate RS   │  ← Relative Strength vs BTC (с защитой от div/0)
 └────────┬────────┘
          │
          ▼
@@ -227,8 +313,18 @@ type Engine struct {
          │
          ▼
 ┌─────────────────┐
+│  Volume Check   │  ← Volume > 1.5x avg? (проверка до дорогих операций)
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Wick Analysis  │  ← Close near bottom?
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
 │  Detect         │
-│  Support Level  │  ← Fractal Low pattern
+│  Support Level  │  ← Fractal Low pattern (60 минут)
 └────────┬────────┘
          │
          ▼
@@ -239,24 +335,14 @@ type Engine struct {
          │
          ▼
 ┌─────────────────┐
-│  Wick Analysis  │  ← Close near bottom?
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Check Volume   │  ← Volume > 1.5x avg?
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
 │  Calculate      │
 │  Score (0-100)  │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Generate       │
-│  Signal         │
+│  Check          │
+│  Cooldown       │  ← 15 минут между сигналами
 └────────┬────────┘
          │
          ▼
@@ -278,6 +364,7 @@ type Engine struct {
 3. **С высоким объёмом** (подтверждение продаж)
 4. **Не в crowded short** (funding rate не слишком отрицательный)
 5. **Закрылись у нижней границы свечи** (без buyback)
+6. **Не дублируют недавний сигнал** (cooldown 15 минут)
 
 ---
 
@@ -302,21 +389,17 @@ RS(ETH) = -1.0% - 2.5% = -3.5%  ← Слабее рынка на 3.5%
 
 **Триггер**: RS < -3% (актив отстаёт от BTC)
 
-**Логика**:
+**Защита от Division by Zero**:
 ```go
-func calculateRS(symbol string) float64 {
-    // Адаптивный lookback: 30-60 минут
-    lookback := min(60, len(assetCandles), len(btcCandles))
-
-    assetOld := assetCandles[len-lookback].Close
-    assetNew := assetCandles[len-1].Close
-    assetChange := ((assetNew - assetOld) / assetOld) * 100
-
-    btcOld := btcCandles[len-lookback].Close
-    btcNew := btcCandles[len-1].Close
-    btcChange := ((btcNew - btcOld) / btcOld) * 100
-
-    return assetChange - btcChange
+func (e *Engine) calculateRS(symbol string) (float64, error) {
+    // ...
+    if assetOld == 0 {
+        return 0, fmt.Errorf("asset old price is zero")
+    }
+    if btcOld == 0 {
+        return 0, fmt.Errorf("BTC old price is zero")
+    }
+    // ...
 }
 ```
 
@@ -347,36 +430,7 @@ Price
        i-2  i  i+2
 ```
 
-**Период поиска**: Последние 30 минут
-
-**Логика**:
-```go
-func detectSupport(candles []Candle) *SupportLevel {
-    recentCandles := candles[len-30:]  // 30 минут
-
-    for i := 2; i < len(recentCandles)-2; i++ {
-        low := recentCandles[i].Low
-        isFractal := true
-
-        // Проверка окружающих свечей
-        for j := i-2; j <= i+2; j++ {
-            if j == i { continue }
-            if recentCandles[j].Low < low {
-                isFractal = false
-                break
-            }
-        }
-
-        if isFractal {
-            return &SupportLevel{
-                Price: low,
-                Timestamp: recentCandles[i].Timestamp
-            }
-        }
-    }
-    return nil
-}
-```
+**Период поиска**: Последние **60 минут** (было 30 — исправлено для достижимости бонуса возраста)
 
 ---
 
@@ -436,29 +490,7 @@ Volume Ratio = Current Volume / Average Volume
 
 **Average Volume**: Средний объём за последние 20 свечей
 
-**Триггер**: Volume Ratio > 1.5
-
-**Логика**:
-```go
-func calculateAvgVolume(candles []Candle) float64 {
-    recentCandles := candles[len-20:]  // Последние 20 свечей
-
-    sum := 0.0
-    for _, c := range recentCandles {
-        sum += c.Volume
-    }
-
-    return sum / float64(len(recentCandles))
-}
-
-// В основной функции:
-avgVolume := calculateAvgVolume(candles)
-volumeRatio := currentCandle.Volume / avgVolume
-
-if volumeRatio < 1.5 {
-    return nil  // Не достаточно объёма, нет сигнала
-}
-```
+**Триггер**: Volume Ratio >= 1.5
 
 **Примеры**:
 
@@ -479,70 +511,48 @@ if volumeRatio < 1.5 {
 #### 1. **Слабость актива** (до 40 баллов)
 
 ```go
-score := 0
-
-if RS < -3.0 {
+if rs < -3.0 {
     score += 30  // Базовая слабость
-
-    if RS < -5.0 {
+    if rs < -5.0 {
         score += 10  // Экстремальная слабость
     }
 }
 ```
 
-**Примеры**:
-- RS = -2.0% → 0 баллов
-- RS = -3.5% → 30 баллов
-- RS = -6.0% → 40 баллов
-
 #### 2. **Объём пробоя** (до 30 баллов)
 
 ```go
-if volumeRatio > 2.0 {
-    score += 20  // Высокий объём
-
-    if volumeRatio > 3.0 {
-        score += 10  // Исключительный объём
+if volumeRatio >= 1.5 {
+    score += 10  // Базовый объём (NEW!)
+    if volumeRatio >= 2.0 {
+        score += 10  // Высокий объём
+        if volumeRatio >= 3.0 {
+            score += 10  // Исключительный объём
+        }
     }
 }
 ```
 
-**Примеры**:
-- Volume Ratio = 1.8x → 0 баллов (не прошёл триггер 1.5x)
-- Volume Ratio = 2.3x → 20 баллов
-- Volume Ratio = 3.5x → 30 баллов
+> **Исправлено**: Добавлен базовый score +10 для volume >= 1.5x (ранее диапазон 1.5x-2x не давал баллов).
 
 #### 3. **Возраст уровня поддержки** (20 баллов)
 
 ```go
-supportAge := time.Since(support.Timestamp).Minutes()
-
-if supportAge > 30 {
+supportAgeMinutes := time.Since(support.Timestamp).Minutes()
+if supportAgeMinutes > 20 {  // Было 30, исправлено
     score += 20
 }
 ```
 
-**Логика**: Чем дольше уровень держался, тем значимее его пробой.
-
-**Примеры**:
-- Уровень существует 15 минут → 0 баллов
-- Уровень существует 45 минут → 20 баллов
+> **Исправлено**: Порог снижен до 20 минут и SupportLookback увеличен до 60 минут — бонус теперь достижим.
 
 #### 4. **Дивергенция с BTC** (10 баллов)
 
 ```go
-// Сравниваем последние 2 свечи
-btcChange := ((btcCurrent - btcPrevious) / btcPrevious) * 100
-assetChange := ((assetCurrent - assetPrevious) / assetPrevious) * 100
-
 if btcChange > 0 && assetChange < 0 {
     score += 10  // BTC растёт, актив падает
 }
 ```
-
-**Логика**: Когда рынок растёт, а актив падает - это особенно слабый знак.
-
----
 
 #### 5. **Funding (положительный)** (20 баллов)
 
@@ -552,10 +562,6 @@ if fundingRate > 0.01 {
 }
 ```
 
-**Логика**: Положительный funding означает, что лонги платят шортам → пробой вниз устойчивее.
-
----
-
 #### 6. **Close Position (сильный пробой)** (10 баллов)
 
 ```go
@@ -563,8 +569,6 @@ if closePosition < 0.1 {
     score += 10
 }
 ```
-
-**Логика**: Закрытие в нижних 10% свечи усиливает качество пробоя.
 
 ---
 
@@ -574,9 +578,10 @@ if closePosition < 0.1 {
 |--------|---------|-------|
 | **Слабость** | RS < -3% | +30 |
 | | RS < -5% | +10 (бонус) |
-| **Объём** | Volume > 2x | +20 |
-| | Volume > 3x | +10 (бонус) |
-| **Возраст уровня** | Age > 30 min | +20 |
+| **Объём** | Volume >= 1.5x | +10 (NEW!) |
+| | Volume >= 2x | +10 |
+| | Volume >= 3x | +10 (бонус) |
+| **Возраст уровня** | Age > 20 min | +20 |
 | **Дивергенция** | BTC↑ Asset↓ | +10 |
 | **Funding** | Funding > 0.01% | +20 |
 | **Close Position** | Close < 10% свечи | +10 |
@@ -608,7 +613,7 @@ func getProbability(score int) string {
 |-------|----------|
 | 90 | RS=-5.5%, Volume=3.2x, Level Age=45min, BTC↑ Asset↓ |
 | 70 | RS=-4.0%, Volume=2.5x, Level Age=35min |
-| 50 | RS=-3.2%, Volume=2.1x, Level Age=20min |
+| 50 | RS=-3.2%, Volume=1.7x, Level Age=25min |
 
 ---
 
@@ -627,16 +632,6 @@ CREATE TABLE assets (
 );
 ```
 
-**Назначение**: Метаданные торгуемых инструментов
-
-**Пример записи**:
-```
-symbol: "BTCUSDT"
-tick_size: 0.01
-min_lot_size: 0.001
-is_tradable: true
-```
-
 #### Таблица `signals`
 
 ```sql
@@ -644,18 +639,12 @@ CREATE TABLE signals (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     symbol VARCHAR(20) REFERENCES assets(symbol),
-
-    -- Технические данные
-    price_trigger DECIMAL NOT NULL,      -- Цена закрытия при пробое
-    level_broken DECIMAL NOT NULL,       -- Пробитый уровень поддержки
-    breakdown_volume DECIMAL,            -- Объём при пробое
-
-    -- Скоринг
-    score_rs DECIMAL,                    -- Relative Strength
-    score_total INT,                     -- Итоговый скор 0-100
-
-    -- Метаданные
-    meta JSONB                           -- Дополнительные данные
+    price_trigger DECIMAL NOT NULL,
+    level_broken DECIMAL NOT NULL,
+    breakdown_volume DECIMAL,
+    score_rs DECIMAL,
+    score_total INT,
+    meta JSONB
 );
 
 CREATE INDEX idx_signals_symbol_time ON signals(symbol, created_at DESC);
@@ -683,32 +672,6 @@ CREATE INDEX idx_signals_symbol_time ON signals(symbol, created_at DESC);
 }
 ```
 
-#### Миграции
-
-**Автоматические** при старте бота:
-
-```go
-func migrate(ctx context.Context) error {
-    migrations := []string{
-        `CREATE TABLE IF NOT EXISTS assets (...)`,
-        `CREATE TABLE IF NOT EXISTS signals (...)`,
-        `CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ...`,
-    }
-
-    for _, migration := range migrations {
-        if _, err := pool.Exec(ctx, migration); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-**Преимущества**:
-- ✅ Нет необходимости в отдельных SQL скриптах
-- ✅ Идемпотентность (`IF NOT EXISTS`)
-- ✅ Всегда актуальная схема
-
 ---
 
 ## Telegram Notifications
@@ -733,21 +696,6 @@ func migrate(ctx context.Context) error {
 *(Высокая вероятность падения)*
 ```
 
-### Telegram API
-
-**Endpoint**: `https://api.telegram.org/bot<TOKEN>/sendMessage`
-
-**Payload**:
-```json
-{
-  "chat_id": "123456789",
-  "text": "...",
-  "parse_mode": "Markdown"
-}
-```
-
-**Retry Policy**: Нет автоматических повторов (логируем ошибку)
-
 ---
 
 ## Обработка ошибок
@@ -756,18 +704,29 @@ func migrate(ctx context.Context) error {
 
 **Trigger**: Read error или timeout
 
-**Action**:
+**Action** (внутри WSClient — SRP):
 ```go
 1. Логируем ошибку
-2. Отправляем сигнал в канал reconnect
-3. Закрываем текущее соединение
-4. Ждём 5 секунд
-5. Переподключаемся с exponential backoff (1s, 2s, 4s, 8s, 16s)
-6. Максимум 5 попыток
-7. Fatal error если не удалось
+2. Устанавливаем connected = false
+3. Запускаем reconnect с exponential backoff
+4. Delay: 1s → 2s → 4s → ... → 60s (cap)
+5. Максимум 10 попыток
+6. Fatal error если не удалось
 ```
 
-### 2. **Database Errors**
+### 2. **Invalid Candle Data**
+
+**Trigger**: Невалидные данные из WebSocket
+
+**Action**:
+```go
+1. Валидация: High >= Low, Close in range, Volume >= 0
+2. Логируем warning с деталями
+3. Пропускаем свечу
+4. Продолжаем обработку
+```
+
+### 3. **Database Errors**
 
 **Trigger**: Connection lost, query failed
 
@@ -778,26 +737,27 @@ func migrate(ctx context.Context) error {
 3. Connection pool автоматически восстановит соединение
 ```
 
-### 3. **Telegram Send Errors**
-
-**Trigger**: HTTP error, timeout
-
-**Action**:
-```go
-1. Логируем ошибку
-2. Продолжаем работу
-3. Сигнал сохранён в БД, можно переотправить вручную
-```
-
 ### 4. **ByBit API 403 (Cloudflare)**
 
 **Trigger**: REST API blocked by Cloudflare
 
 **Action**:
 ```go
-1. Логируем warning
-2. Переключаемся на fallback список из 100 символов
-3. Продолжаем работу с захардкоженными инструментами
+1. Пробуем альтернативные endpoints (api.bytick.com, api.bybit.nl)
+2. Если все недоступны → используем fallback список символов
+3. Для funding rates → используем нулевые значения
+4. Продолжаем работу
+```
+
+### 5. **Division by Zero in RS**
+
+**Trigger**: Old price = 0 (ошибка данных)
+
+**Action**:
+```go
+1. calculateRS возвращает error
+2. Сигнал не генерируется для этого символа
+3. Логируем debug с причиной
 ```
 
 ---
@@ -808,75 +768,20 @@ func migrate(ctx context.Context) error {
 
 | Метрика | Значение |
 |---------|----------|
-| **Memory** | ~50-100 MB (24k свечей в памяти) |
+| **Memory** | ~50-100 MB (RingBuffer — без memory leak) |
 | **CPU** | <5% (горутины + легковесные вычисления) |
 | **Latency** | <100ms от получения свечи до генерации сигнала |
 | **Throughput** | ~100 свечей/минуту (real-time) |
 
 ### Оптимизации
 
-1. **Ring Buffer**: Фиксированный размер, избегаем аллокаций
-2. **Channels**: Буферизованные каналы (1000 элементов)
-3. **Connection Pooling**: pgxpool с 2-10 коннектами
-4. **Goroutines**: Отдельные горутины для I/O операций
-
----
-
-## Мониторинг
-
-### Логирование (zerolog)
-
-**Уровни**:
-- `DEBUG`: Прогресс сбора данных
-- `INFO`: Важные события (подключения, сигналы)
-- `WARN`: Предупреждения (API fallback, reconnect)
-- `ERROR`: Ошибки (failed DB save, Telegram send)
-- `FATAL`: Критичные ошибки (нет DATABASE_URL)
-
-**Structured Logging**:
-```go
-log.Info().
-    Str("symbol", "SOLUSDT").
-    Int("score", 85).
-    Float64("rs", -4.2).
-    Msg("signal generated")
-```
-
-**Output** (JSON в production):
-```json
-{
-  "level": "info",
-  "symbol": "SOLUSDT",
-  "score": 85,
-  "rs": -4.2,
-  "time": "2026-01-26T12:45:30Z",
-  "message": "signal generated"
-}
-```
-
-### Периодическая статистика
-
-**Каждые 5 минут**:
-```go
-stats := map[string]interface{}{
-    "tracked_symbols": len(candleCache),
-    "btc_candles": len(btcCandles),
-}
-
-log.Info().Interface("stats", stats).Msg("engine statistics")
-```
-
-**Пример вывода**:
-```json
-{
-  "level": "info",
-  "stats": {
-    "tracked_symbols": 61,
-    "btc_candles": 30
-  },
-  "message": "engine statistics"
-}
-```
+1. **RingBuffer**: Фиксированный размер, O(1) операции, без аллокаций
+2. **BTC отдельно**: Нет дублирования в candleCache
+3. **Early exit**: Volume check перед дорогими операциями
+4. **Channels**: Буферизованные каналы (1000 элементов)
+5. **Connection Pooling**: pgxpool с 2-10 коннектами
+6. **Goroutines**: Отдельные горутины для I/O операций
+7. **Signal Cooldown**: Предотвращение дубликатов без лишних вычислений
 
 ---
 
@@ -913,58 +818,12 @@ log.Info().Interface("stats", stats).Msg("engine statistics")
 sigChan := make(chan os.Signal, 1)
 signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-<-sigChan  // Блокируем до получения сигнала
-
+<-sigChan
 log.Info().Msg("🛑 Shutdown signal received")
-cancel()   // Отменяем context
-time.Sleep(2 * time.Second)  // Даём горутинам завершиться
+cancel()
+time.Sleep(2 * time.Second)
 log.Info().Msg("👋 Bot stopped")
 ```
-
----
-
-## Безопасность
-
-### 1. **Environment Variables**
-
-- ✅ Все секреты через ENV (не в коде)
-- ✅ `.env` файл в `.gitignore`
-- ✅ `.env.example` для документации
-
-### 2. **Database**
-
-- ✅ Connection pooling с лимитами
-- ✅ Prepared statements (защита от SQL injection)
-- ✅ SSL соединение на production (Railway автоматически)
-
-### 3. **External APIs**
-
-- ✅ Timeout на всех HTTP запросах (10-30s)
-- ✅ User-Agent headers для обхода Cloudflare
-- ✅ Fallback механизмы при блокировке
-
----
-
-## Масштабирование
-
-### Горизонтальное
-
-**Ограничение**: Нельзя запускать несколько инстансов из-за:
-- Дублирование сигналов в Telegram
-- Конкуренция за WebSocket соединение
-
-**Решение** (если нужно):
-- Distributed lock (Redis)
-- Partitioning символов между инстансами
-
-### Вертикальное
-
-**Текущий профиль**: Railway Hobby Plan (~512MB RAM)
-
-**Можно увеличить**:
-- Количество символов (сейчас 100)
-- Глубину истории (сейчас 240 свечей)
-- Частоту статистики
 
 ---
 
@@ -974,30 +833,46 @@ log.Info().Msg("👋 Bot stopped")
 |-----------|------------|----------|
 | **Runtime** | Go 1.22 | Высокопроизводительный, низкий memory footprint |
 | **Database** | PostgreSQL 15+ | Надёжное хранение сигналов |
-| **WebSocket** | gorilla/websocket | Real-time стриминг свечей |
+| **WebSocket** | gorilla/websocket | Real-time стриминг свечей + auto-reconnect |
 | **Logging** | zerolog | Structured JSON logs |
 | **Deployment** | Railway | Containerized, auto-deploy |
 | | | |
 | **Latency** | <100ms | От свечи до сигнала |
-| **Memory** | ~50-100MB | 24k свечей в памяти |
+| **Memory** | ~50-100MB | RingBuffer без memory leak |
 | **Symbols** | 100 USDT Perps | Mid-cap, исключая Top-15 |
 | **Warmup** | 30 минут | До первого сигнала |
+| **Cooldown** | 15 минут | Между сигналами по символу |
 
 ---
 
-## Дальнейшие улучшения
+## История изменений
 
-### Потенциальные фичи
+### v1.2.0 (26 января 2026)
 
-1. **Backtesting**: Исторический анализ эффективности стратегии
-2. **Multiple Timeframes**: Поддержка 5m, 15m свечей
-3. **Additional Indicators**: RSI, MACD, Bollinger Bands
-4. **Smart Filtering**: Cooldown между сигналами по символу
-5. **Web Dashboard**: Real-time мониторинг через веб-интерфейс
-6. **Alert Customization**: Пользовательские пороги скоринга
+**Исправленные баги**:
+- ✅ WebSocket reconnect перенесён внутрь WSClient (SRP)
+- ✅ RingBuffer вместо slice trimming (memory leak fix)
+- ✅ Division by zero protection в calculateRS
+- ✅ Candle validation перед обработкой
+- ✅ SupportLookback увеличен до 60 минут
+- ✅ Support age bonus порог снижен до 20 минут
+- ✅ Volume scoring: добавлен базовый score для 1.5x+
+- ✅ BTC candles не дублируются в candleCache
+- ✅ Signal cooldown 15 минут
+
+**Принципы**:
+- **SRP**: WSClient управляет своим соединением
+- **DRY**: RingBuffer переиспользуется для всех символов
+- **Early Exit**: Дешёвые проверки перед дорогими операциями
+
+### v1.1.0 (ранее)
+
+- Базовая реализация стратегии
+- WebSocket стриминг
+- Telegram уведомления
 
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.1.0
+**Версия бота**: 1.2.0
 **Автор архитектуры**: AI-assisted development

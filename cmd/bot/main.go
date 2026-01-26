@@ -10,6 +10,7 @@ import (
 	"github.com/islamtagirov/millionaire-bot/internal/bybit"
 	"github.com/islamtagirov/millionaire-bot/internal/config"
 	"github.com/islamtagirov/millionaire-bot/internal/db"
+	"github.com/islamtagirov/millionaire-bot/internal/models"
 	"github.com/islamtagirov/millionaire-bot/internal/strategy"
 	"github.com/islamtagirov/millionaire-bot/internal/telegram"
 	"github.com/rs/zerolog"
@@ -17,12 +18,10 @@ import (
 )
 
 func main() {
-	// Setup logger
 	setupLogger()
 
 	log.Info().Msg("🚀 Starting Millionaire Bot")
 
-	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
@@ -30,7 +29,6 @@ func main() {
 
 	log.Info().Msg("configuration loaded successfully")
 
-	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -60,31 +58,17 @@ func main() {
 	}
 
 	// Extract symbol list for WebSocket subscription
-	symbols := make([]string, len(assets))
-	for i, asset := range assets {
-		symbols[i] = asset.Symbol
-	}
+	symbols := extractSymbols(assets)
 
 	// Ensure BTCUSDT is included for RS calculation
-	hasBTC := false
-	for _, sym := range symbols {
-		if sym == "BTCUSDT" {
-			hasBTC = true
-			break
-		}
-	}
-	if !hasBTC {
-		log.Warn().Msg("BTCUSDT not in top 100, adding it for RS calculation")
-		symbols = append(symbols, "BTCUSDT")
-	}
+	symbols = ensureBTCIncluded(symbols)
 
 	// Initialize strategy engine
 	engine := strategy.NewEngine()
 
+	// Funding rates updater
 	updateFundingRates := func() {
 		rates, _ := apiClient.GetFundingRates(symbols)
-		// GetFundingRates now always returns rates (with fallback to 0)
-		// so we just update the engine
 		engine.UpdateFundingRates(rates)
 	}
 
@@ -94,10 +78,8 @@ func main() {
 	// Initialize Telegram notifier
 	notifier := telegram.NewNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
 
-	// Initialize WebSocket client
+	// Initialize and connect WebSocket client (handles reconnection internally)
 	wsClient := bybit.NewWSClient(cfg.ByBitWSURL, symbols)
-
-	// Connect to WebSocket
 	if err := wsClient.Connect(ctx); err != nil {
 		log.Fatal().Err(err).Msg("failed to connect to WebSocket")
 	}
@@ -110,30 +92,9 @@ func main() {
 	// Start processing goroutines
 	go processCandles(ctx, engine, wsClient)
 	go processSignals(ctx, engine, store, notifier)
-	go handleReconnect(ctx, wsClient, symbols, cfg.ByBitWSURL)
 
-	// Log stats periodically
-	statsTicker := time.NewTicker(5 * time.Minute)
-	defer statsTicker.Stop()
-
-	fundingTicker := time.NewTicker(5 * time.Minute)
-	defer fundingTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsTicker.C:
-				stats := engine.GetStats()
-				log.Info().
-					Interface("stats", stats).
-					Msg("engine statistics")
-			case <-fundingTicker.C:
-				updateFundingRates()
-			}
-		}
-	}()
+	// Start periodic tasks
+	go runPeriodicTasks(ctx, engine, updateFundingRates)
 
 	log.Info().Msg("✅ Bot is running and monitoring markets")
 
@@ -141,22 +102,34 @@ func main() {
 	<-sigChan
 	log.Info().Msg("🛑 Shutdown signal received, stopping gracefully...")
 
-	// Cancel context to stop all goroutines
 	cancel()
-
-	// Give goroutines time to finish
 	time.Sleep(2 * time.Second)
 
 	log.Info().Msg("👋 Bot stopped")
 }
 
 func setupLogger() {
-	// Pretty console logging for development
 	output := zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
 	log.Logger = zerolog.New(output).With().Timestamp().Caller().Logger()
-
-	// Set log level
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+}
+
+func extractSymbols(assets []models.Asset) []string {
+	symbols := make([]string, len(assets))
+	for i, asset := range assets {
+		symbols[i] = asset.Symbol
+	}
+	return symbols
+}
+
+func ensureBTCIncluded(symbols []string) []string {
+	for _, sym := range symbols {
+		if sym == "BTCUSDT" {
+			return symbols
+		}
+	}
+	log.Warn().Msg("BTCUSDT not in top 100, adding it for RS calculation")
+	return append(symbols, "BTCUSDT")
 }
 
 func processCandles(ctx context.Context, engine *strategy.Engine, wsClient *bybit.WSClient) {
@@ -194,39 +167,21 @@ func processSignals(ctx context.Context, engine *strategy.Engine, store *db.Stor
 	}
 }
 
-func handleReconnect(ctx context.Context, wsClient *bybit.WSClient, symbols []string, wsURL string) {
-	reconnectChan := wsClient.GetReconnectChannel()
+func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateFundingRates func()) {
+	statsTicker := time.NewTicker(5 * time.Minute)
+	fundingTicker := time.NewTicker(5 * time.Minute)
+	defer statsTicker.Stop()
+	defer fundingTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-reconnectChan:
-			log.Warn().Msg("reconnection triggered, attempting to reconnect...")
-
-			// Close old connection
-			wsClient.Close()
-
-			// Wait before reconnecting
-			time.Sleep(5 * time.Second)
-
-			// Create new WebSocket client
-			newWSClient := bybit.NewWSClient(wsURL, symbols)
-
-			// Try to reconnect with exponential backoff
-			maxRetries := 5
-			for i := 0; i < maxRetries; i++ {
-				if err := newWSClient.Connect(ctx); err != nil {
-					log.Error().Err(err).Int("attempt", i+1).Msg("reconnection failed")
-					time.Sleep(time.Duration(1<<uint(i)) * time.Second) // Exponential backoff
-					continue
-				}
-
-				log.Info().Msg("✅ reconnected successfully")
-				return
-			}
-
-			log.Fatal().Msg("failed to reconnect after max retries")
+		case <-statsTicker.C:
+			stats := engine.GetStats()
+			log.Info().Interface("stats", stats).Msg("engine statistics")
+		case <-fundingTicker.C:
+			updateFundingRates()
 		}
 	}
 }

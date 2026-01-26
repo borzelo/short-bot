@@ -10,28 +10,122 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// Configuration constants
 const (
-	MaxCandlesInMemory = 240 // 4 hours of 1-minute candles (keep for history)
-	RSLookbackMinutes  = 60  // 1 hour for RS calculation (was 4h, too conservative)
+	MaxCandlesInMemory = 240 // 4 hours of 1-minute candles
+	RSLookbackMinutes  = 60  // 1 hour for RS calculation
 	MinRSLookback      = 30  // Minimum 30 minutes to start analysis
-	SupportLookback    = 30  // 30 minutes for support detection (was 60m)
+	SupportLookback    = 60  // 60 minutes for support detection (was 30 - bug fix)
 	VolumeAvgWindow    = 20  // 20 candles for volume average
+	SignalCooldownMins = 15  // Cooldown between signals for same symbol
 )
 
+// Scoring thresholds
+const (
+	RSWeakThreshold     = -3.0  // Minimum RS to consider asset weak
+	RSVeryWeakThreshold = -5.0  // RS threshold for extra weakness points
+	VolumeMinRatio      = 1.5   // Minimum volume ratio for signal
+	VolumeMediumRatio   = 2.0   // Medium volume ratio for scoring
+	VolumeHighRatio     = 3.0   // High volume ratio for extra points
+	ClosePositionMax    = 0.3   // Maximum close position (bottom 30%)
+	ClosePositionStrong = 0.1   // Strong close position for bonus
+	FundingAntiSqueeze  = -0.015 // Funding rate floor (anti-squeeze)
+	FundingPositive     = 0.01  // Positive funding threshold for bonus
+	SupportAgeBonus     = 20.0  // Minutes for support age bonus
+	MinScoreForSignal   = 50    // Minimum score to generate signal
+)
+
+// Engine processes candles and generates signals
 type Engine struct {
-	mu          sync.RWMutex
-	candleCache map[string][]models.Candle // symbol -> ring buffer of candles
-	btcCandles  []models.Candle            // BTC candles for RS calculation
-	fundingRates map[string]float64        // symbol -> funding rate (percent)
-	signalChan  chan *models.Signal
+	mu           sync.RWMutex
+	candleCache  map[string]*RingBuffer // symbol -> ring buffer of candles
+	btcBuffer    *RingBuffer            // BTC candles for RS calculation
+	fundingRates map[string]float64     // symbol -> funding rate (percent)
+	signalChan   chan *models.Signal
+	lastSignal   map[string]time.Time   // symbol -> last signal time (cooldown)
+}
+
+// RingBuffer is a memory-efficient circular buffer for candles
+type RingBuffer struct {
+	data  []models.Candle
+	size  int
+	head  int
+	count int
+}
+
+// NewRingBuffer creates a new ring buffer with given capacity
+func NewRingBuffer(capacity int) *RingBuffer {
+	return &RingBuffer{
+		data: make([]models.Candle, capacity),
+		size: capacity,
+	}
+}
+
+// Push adds a candle to the buffer, overwriting oldest if full
+func (rb *RingBuffer) Push(c models.Candle) {
+	rb.data[rb.head] = c
+	rb.head = (rb.head + 1) % rb.size
+	if rb.count < rb.size {
+		rb.count++
+	}
+}
+
+// Len returns the number of candles in the buffer
+func (rb *RingBuffer) Len() int {
+	return rb.count
+}
+
+// Get returns candle at logical index (0 = oldest, Len()-1 = newest)
+func (rb *RingBuffer) Get(i int) models.Candle {
+	if i < 0 || i >= rb.count {
+		return models.Candle{}
+	}
+	start := (rb.head - rb.count + rb.size) % rb.size
+	return rb.data[(start+i)%rb.size]
+}
+
+// Last returns the most recent candle
+func (rb *RingBuffer) Last() models.Candle {
+	if rb.count == 0 {
+		return models.Candle{}
+	}
+	return rb.Get(rb.count - 1)
+}
+
+// GetRange returns candles from startIdx to endIdx (exclusive)
+func (rb *RingBuffer) GetRange(startIdx, endIdx int) []models.Candle {
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx > rb.count {
+		endIdx = rb.count
+	}
+	if startIdx >= endIdx {
+		return nil
+	}
+
+	result := make([]models.Candle, endIdx-startIdx)
+	for i := startIdx; i < endIdx; i++ {
+		result[i-startIdx] = rb.Get(i)
+	}
+	return result
+}
+
+// LastN returns the last n candles (newest last)
+func (rb *RingBuffer) LastN(n int) []models.Candle {
+	if n > rb.count {
+		n = rb.count
+	}
+	return rb.GetRange(rb.count-n, rb.count)
 }
 
 func NewEngine() *Engine {
 	return &Engine{
-		candleCache:  make(map[string][]models.Candle),
-		btcCandles:   make([]models.Candle, 0),
+		candleCache:  make(map[string]*RingBuffer),
+		btcBuffer:    NewRingBuffer(MaxCandlesInMemory),
 		fundingRates: make(map[string]float64),
 		signalChan:   make(chan *models.Signal, 100),
+		lastSignal:   make(map[string]time.Time),
 	}
 }
 
@@ -39,130 +133,142 @@ func (e *Engine) ProcessCandle(candle models.Candle) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Store candle in cache
+	// Store BTC candles in dedicated buffer (not duplicated in candleCache)
 	if candle.Symbol == "BTCUSDT" {
-		e.btcCandles = append(e.btcCandles, candle)
-		if len(e.btcCandles) > MaxCandlesInMemory {
-			e.btcCandles = e.btcCandles[1:]
-		}
+		e.btcBuffer.Push(candle)
+		// BTC is only for RS calculation, not for signals
+		return
 	}
 
+	// Store candle in symbol-specific buffer
 	if _, exists := e.candleCache[candle.Symbol]; !exists {
-		e.candleCache[candle.Symbol] = make([]models.Candle, 0, MaxCandlesInMemory)
+		e.candleCache[candle.Symbol] = NewRingBuffer(MaxCandlesInMemory)
 	}
+	e.candleCache[candle.Symbol].Push(candle)
 
-	e.candleCache[candle.Symbol] = append(e.candleCache[candle.Symbol], candle)
-	if len(e.candleCache[candle.Symbol]) > MaxCandlesInMemory {
-		e.candleCache[candle.Symbol] = e.candleCache[candle.Symbol][1:]
-	}
+	// Check if we have enough data for analysis
+	assetCount := e.candleCache[candle.Symbol].Len()
+	btcCount := e.btcBuffer.Len()
 
-	// Skip analysis if not enough data
-	// Use minimum 30 minutes to start, but prefer 60 minutes for better accuracy
-	minDataPoints := MinRSLookback
-	assetDataPoints := len(e.candleCache[candle.Symbol])
-	btcDataPoints := len(e.btcCandles)
-
-	if assetDataPoints < minDataPoints || btcDataPoints < minDataPoints {
-		// Log progress every 10 candles
-		if assetDataPoints%10 == 0 {
+	if assetCount < MinRSLookback || btcCount < MinRSLookback {
+		if assetCount%10 == 0 {
 			log.Debug().
 				Str("symbol", candle.Symbol).
-				Int("asset_candles", assetDataPoints).
-				Int("btc_candles", btcDataPoints).
-				Int("needed", minDataPoints).
+				Int("asset_candles", assetCount).
+				Int("btc_candles", btcCount).
+				Int("needed", MinRSLookback).
 				Msg("collecting data before analysis starts")
 		}
 		return
 	}
 
-	// Log when we start analyzing a new symbol for the first time
-	if assetDataPoints == minDataPoints {
+	// Log when analysis starts for a symbol
+	if assetCount == MinRSLookback {
 		log.Info().
 			Str("symbol", candle.Symbol).
-			Int("candles", assetDataPoints).
+			Int("candles", assetCount).
 			Msg("started analysis for symbol - enough data collected")
 	}
 
 	// Analyze for breakdown signal
 	signal := e.analyzeBreakdown(candle.Symbol)
 	if signal != nil {
-		select {
-		case e.signalChan <- signal:
-			log.Info().
+		e.emitSignal(signal)
+	}
+}
+
+func (e *Engine) emitSignal(signal *models.Signal) {
+	// Check cooldown
+	if lastTime, exists := e.lastSignal[signal.Symbol]; exists {
+		if time.Since(lastTime).Minutes() < SignalCooldownMins {
+			log.Debug().
 				Str("symbol", signal.Symbol).
-				Int("score", signal.ScoreTotal).
-				Float64("rs", signal.ScoreRS).
-				Float64("price", signal.PriceTrigger).
-				Float64("support", signal.LevelBroken).
-				Msg("✅ HIGH-QUALITY SIGNAL GENERATED")
-		default:
-			log.Warn().Str("symbol", candle.Symbol).Msg("signal channel full")
+				Float64("minutes_since_last", time.Since(lastTime).Minutes()).
+				Msg("signal skipped due to cooldown")
+			return
 		}
+	}
+
+	select {
+	case e.signalChan <- signal:
+		e.lastSignal[signal.Symbol] = time.Now()
+		log.Info().
+			Str("symbol", signal.Symbol).
+			Int("score", signal.ScoreTotal).
+			Float64("rs", signal.ScoreRS).
+			Float64("price", signal.PriceTrigger).
+			Float64("support", signal.LevelBroken).
+			Msg("✅ HIGH-QUALITY SIGNAL GENERATED")
+	default:
+		log.Warn().Str("symbol", signal.Symbol).Msg("signal channel full")
 	}
 }
 
 func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
-	candles := e.candleCache[symbol]
-	if len(candles) == 0 {
+	buffer := e.candleCache[symbol]
+	if buffer == nil || buffer.Len() == 0 {
 		return nil
 	}
 
-	currentCandle := candles[len(candles)-1]
+	currentCandle := buffer.Last()
 
 	// 1. Calculate Relative Strength (RS)
-	rs := e.calculateRS(symbol)
-
-	// CRITICAL: Check weakness - RS must be < -3% (asset weaker than BTC)
-	if rs >= -3.0 {
-		// Not weak enough, skip analysis
+	rs, err := e.calculateRS(symbol)
+	if err != nil {
+		log.Debug().Err(err).Str("symbol", symbol).Msg("RS calculation failed")
 		return nil
 	}
 
-	// 2. Check funding rate (anti-squeeze)
+	// Check weakness threshold
+	if rs >= RSWeakThreshold {
+		return nil
+	}
+
+	// 2. Check funding rate (anti-squeeze filter)
 	fundingRate := e.fundingRates[symbol]
-	if fundingRate < -0.015 {
+	if fundingRate < FundingAntiSqueeze {
 		return nil
 	}
 
-	// 3. Detect support level
-	support := e.detectSupport(candles)
-	if support == nil {
-		return nil
-	}
-
-	// 4. Check breakdown condition: Close < Support
-	if currentCandle.Close >= support.Price {
-		return nil
-	}
-
-	// 5. Confirm no buyback wick (close in bottom 30%)
-	candleRange := currentCandle.High - currentCandle.Low
-	if candleRange <= 0 {
-		return nil
-	}
-	closePosition := (currentCandle.Close - currentCandle.Low) / candleRange
-	if closePosition > 0.3 {
-		return nil
-	}
-
-	// 6. Calculate average volume
-	avgVolume := e.calculateAvgVolume(candles)
+	// 3. Calculate average volume first (cheap operation)
+	avgVolume := e.calculateAvgVolume(buffer)
 	if avgVolume == 0 {
 		return nil
 	}
 
 	volumeRatio := currentCandle.Volume / avgVolume
 
-	// 7. Check volume condition: Volume > 1.5x average
-	if volumeRatio < 1.5 {
+	// 4. Check volume threshold early
+	if volumeRatio < VolumeMinRatio {
+		return nil
+	}
+
+	// 5. Check close position (no buyback wick)
+	candleRange := currentCandle.High - currentCandle.Low
+	if candleRange <= 0 {
+		return nil
+	}
+	closePosition := (currentCandle.Close - currentCandle.Low) / candleRange
+	if closePosition > ClosePositionMax {
+		return nil
+	}
+
+	// 6. Detect support level
+	support := e.detectSupport(buffer)
+	if support == nil {
+		return nil
+	}
+
+	// 7. Check breakdown condition: Close < Support
+	if currentCandle.Close >= support.Price {
 		return nil
 	}
 
 	// 8. Calculate score
 	score := e.calculateScore(rs, volumeRatio, support, currentCandle, fundingRate, closePosition)
 
-	// CRITICAL: Only generate signals with score >= 50 (medium probability or higher)
-	if score < 50 {
+	// Check minimum score threshold
+	if score < MinScoreForSignal {
 		log.Debug().
 			Str("symbol", symbol).
 			Int("score", score).
@@ -172,8 +278,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// Create signal
-	signal := &models.Signal{
+	return &models.Signal{
 		CreatedAt:       time.Now(),
 		Symbol:          symbol,
 		PriceTrigger:    currentCandle.Close,
@@ -182,57 +287,66 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		ScoreRS:         rs,
 		ScoreTotal:      score,
 		Meta: map[string]interface{}{
-			"volume_ratio":         volumeRatio,
-			"funding_rate":         fundingRate,
-			"close_position":       closePosition,
-			"support_age_minutes":  time.Since(support.Timestamp).Minutes(),
-			"support_touch_count":  support.TouchCount,
-			"avg_volume":           avgVolume,
+			"volume_ratio":        volumeRatio,
+			"funding_rate":        fundingRate,
+			"close_position":      closePosition,
+			"support_age_minutes": time.Since(support.Timestamp).Minutes(),
+			"support_touch_count": support.TouchCount,
+			"avg_volume":          avgVolume,
 		},
 	}
-
-	return signal
 }
 
-func (e *Engine) calculateRS(symbol string) float64 {
-	if symbol == "BTCUSDT" {
-		return 0 // BTC has no RS against itself
+func (e *Engine) calculateRS(symbol string) (float64, error) {
+	buffer := e.candleCache[symbol]
+	if buffer == nil {
+		return 0, fmt.Errorf("no data for symbol")
 	}
 
-	assetCandles := e.candleCache[symbol]
-	if len(assetCandles) < MinRSLookback || len(e.btcCandles) < MinRSLookback {
-		return 0
+	assetCount := buffer.Len()
+	btcCount := e.btcBuffer.Len()
+
+	if assetCount < MinRSLookback || btcCount < MinRSLookback {
+		return 0, fmt.Errorf("insufficient data: asset=%d, btc=%d, need=%d", assetCount, btcCount, MinRSLookback)
 	}
 
-	// Adaptive lookback: use what we have, but prefer RSLookbackMinutes (60m)
-	// If we only have 30-60 minutes of data, use it instead of waiting for full 60m
+	// Adaptive lookback: use available data up to RSLookbackMinutes
 	lookback := RSLookbackMinutes
-	if len(assetCandles) < lookback {
-		lookback = len(assetCandles)
+	if assetCount < lookback {
+		lookback = assetCount
 	}
-	if len(e.btcCandles) < lookback {
-		lookback = len(e.btcCandles)
+	if btcCount < lookback {
+		lookback = btcCount
 	}
 
-	// Get price change over the lookback period
-	assetOld := assetCandles[len(assetCandles)-lookback].Close
-	assetNew := assetCandles[len(assetCandles)-1].Close
+	// Get asset price change
+	assetOld := buffer.Get(buffer.Len() - lookback).Close
+	assetNew := buffer.Last().Close
+
+	if assetOld == 0 {
+		return 0, fmt.Errorf("asset old price is zero")
+	}
 	assetChange := ((assetNew - assetOld) / assetOld) * 100
 
-	btcOld := e.btcCandles[len(e.btcCandles)-lookback].Close
-	btcNew := e.btcCandles[len(e.btcCandles)-1].Close
+	// Get BTC price change
+	btcOld := e.btcBuffer.Get(e.btcBuffer.Len() - lookback).Close
+	btcNew := e.btcBuffer.Last().Close
+
+	if btcOld == 0 {
+		return 0, fmt.Errorf("BTC old price is zero")
+	}
 	btcChange := ((btcNew - btcOld) / btcOld) * 100
 
 	// RS = Asset % Change - BTC % Change
-	return assetChange - btcChange
+	return assetChange - btcChange, nil
 }
 
-func (e *Engine) detectSupport(candles []models.Candle) *models.SupportLevel {
-	if len(candles) < SupportLookback {
+func (e *Engine) detectSupport(buffer *RingBuffer) *models.SupportLevel {
+	if buffer.Len() < SupportLookback {
 		return nil
 	}
 
-	recentCandles := candles[len(candles)-SupportLookback:]
+	recentCandles := buffer.LastN(SupportLookback)
 
 	// Find fractal lows: Low[i] < Low[i-2...i+2]
 	var fractals []models.SupportLevel
@@ -241,7 +355,6 @@ func (e *Engine) detectSupport(candles []models.Candle) *models.SupportLevel {
 		low := recentCandles[i].Low
 		isFractal := true
 
-		// Check if this low is lower than surrounding candles
 		for j := i - 2; j <= i+2; j++ {
 			if j == i {
 				continue
@@ -265,17 +378,20 @@ func (e *Engine) detectSupport(candles []models.Candle) *models.SupportLevel {
 	}
 
 	// Return the most recent fractal low
-	mostRecent := fractals[len(fractals)-1]
-	return &mostRecent
+	return &fractals[len(fractals)-1]
 }
 
-func (e *Engine) calculateAvgVolume(candles []models.Candle) float64 {
+func (e *Engine) calculateAvgVolume(buffer *RingBuffer) float64 {
 	window := VolumeAvgWindow
-	if len(candles) < window {
-		window = len(candles)
+	if buffer.Len() < window {
+		window = buffer.Len()
 	}
 
-	recentCandles := candles[len(candles)-window:]
+	if window == 0 {
+		return 0
+	}
+
+	recentCandles := buffer.LastN(window)
 	var sum float64
 	for _, c := range recentCandles {
 		sum += c.Volume
@@ -287,57 +403,60 @@ func (e *Engine) calculateAvgVolume(candles []models.Candle) float64 {
 func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models.SupportLevel, currentCandle models.Candle, fundingRate float64, closePosition float64) int {
 	score := 0
 
-	// Base: 0
-
-	// Weakness scoring
-	if rs < -3.0 {
+	// Weakness scoring (up to 40 points)
+	if rs < RSWeakThreshold {
 		score += 30
-		if rs < -5.0 {
-			score += 10 // Extra 10 for very weak
+		if rs < RSVeryWeakThreshold {
+			score += 10
 		}
 	}
 
-	// Volume scoring
-	if volumeRatio > 2.0 {
-		score += 20
-		if volumeRatio > 3.0 {
-			score += 10 // Extra 10 for exceptional volume
+	// Volume scoring (up to 30 points) - FIXED: now includes 1.5x-2x range
+	if volumeRatio >= VolumeMinRatio {
+		score += 10 // Base score for meeting volume threshold
+		if volumeRatio >= VolumeMediumRatio {
+			score += 10 // Additional for 2x+
+			if volumeRatio >= VolumeHighRatio {
+				score += 10 // Additional for 3x+
+			}
 		}
 	}
 
-	// Level Age scoring
+	// Level Age scoring (20 points)
 	supportAgeMinutes := time.Since(support.Timestamp).Minutes()
-	if supportAgeMinutes > 30 {
+	if supportAgeMinutes > SupportAgeBonus {
 		score += 20
 	}
 
-	// Funding scoring (positive funding supports short breakdowns)
-	if fundingRate > 0.01 {
+	// Funding scoring (20 points) - positive funding supports short breakdowns
+	if fundingRate > FundingPositive {
 		score += 20
 	}
 
-	// Close position scoring (very weak close)
-	if closePosition < 0.1 {
+	// Close position scoring (10 points) - very weak close
+	if closePosition < ClosePositionStrong {
 		score += 10
 	}
 
-	// Trend divergence scoring: BTC Green but Coin Red
-	// Get BTC current change (1 candle)
-	if len(e.btcCandles) >= 2 {
-		btcPrevClose := e.btcCandles[len(e.btcCandles)-2].Close
-		btcCurrentClose := e.btcCandles[len(e.btcCandles)-1].Close
-		btcChange := ((btcCurrentClose - btcPrevClose) / btcPrevClose) * 100
+	// Trend divergence scoring (10 points): BTC green but asset red
+	if e.btcBuffer.Len() >= 2 {
+		btcPrevClose := e.btcBuffer.Get(e.btcBuffer.Len() - 2).Close
+		btcCurrentClose := e.btcBuffer.Last().Close
 
-		// Get asset current change
-		assetCandles := e.candleCache[currentCandle.Symbol]
-		if len(assetCandles) >= 2 {
-			assetPrevClose := assetCandles[len(assetCandles)-2].Close
-			assetCurrentClose := currentCandle.Close
-			assetChange := ((assetCurrentClose - assetPrevClose) / assetPrevClose) * 100
+		if btcPrevClose > 0 {
+			btcChange := ((btcCurrentClose - btcPrevClose) / btcPrevClose) * 100
 
-			// BTC is green (>0%) but asset is red (<0%)
-			if btcChange > 0 && assetChange < 0 {
-				score += 10
+			buffer := e.candleCache[currentCandle.Symbol]
+			if buffer != nil && buffer.Len() >= 2 {
+				assetPrevClose := buffer.Get(buffer.Len() - 2).Close
+				if assetPrevClose > 0 {
+					assetChange := ((currentCandle.Close - assetPrevClose) / assetPrevClose) * 100
+
+					// BTC is green (>0%) but asset is red (<0%)
+					if btcChange > 0 && assetChange < 0 {
+						score += 10
+					}
+				}
 			}
 		}
 	}
@@ -368,18 +487,10 @@ func (e *Engine) GetStats() map[string]interface{} {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	stats := map[string]interface{}{
+	return map[string]interface{}{
 		"tracked_symbols": len(e.candleCache),
-		"btc_candles":     len(e.btcCandles),
+		"btc_candles":     e.btcBuffer.Len(),
 	}
-
-	return stats
-}
-
-// Helper: Format float with precision
-func formatFloat(f float64, precision int) float64 {
-	ratio := math.Pow(10, float64(precision))
-	return math.Round(f*ratio) / ratio
 }
 
 // GetMarketData returns current market data for a symbol (for debugging)
@@ -387,14 +498,17 @@ func (e *Engine) GetMarketData(symbol string) (*models.MarketData, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	candles, exists := e.candleCache[symbol]
-	if !exists || len(candles) == 0 {
+	buffer, exists := e.candleCache[symbol]
+	if !exists || buffer.Len() == 0 {
 		return nil, fmt.Errorf("no data for symbol %s", symbol)
 	}
 
-	currentCandle := candles[len(candles)-1]
-	avgVolume := e.calculateAvgVolume(candles)
-	support := e.detectSupport(candles)
+	currentCandle := buffer.Last()
+	avgVolume := e.calculateAvgVolume(buffer)
+	support := e.detectSupport(buffer)
+
+	// Convert ring buffer to slice for MarketData
+	candles := buffer.LastN(buffer.Len())
 
 	return &models.MarketData{
 		Symbol:        symbol,
@@ -404,4 +518,10 @@ func (e *Engine) GetMarketData(symbol string) (*models.MarketData, error) {
 		AvgVolume:     avgVolume,
 		Support:       support,
 	}, nil
+}
+
+// Helper: Format float with precision (unused but kept for potential future use)
+func formatFloat(f float64, precision int) float64 {
+	ratio := math.Pow(10, float64(precision))
+	return math.Round(f*ratio) / ratio
 }
