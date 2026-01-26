@@ -123,10 +123,11 @@ func TestProcessCandle(t *testing.T) {
 
 	// Add BTC candles for RS calculation
 	baseTime := time.Now()
-	for i := 0; i < RSLookbackMinutes; i++ {
+	candlesToAdd := MinRSLookback + 10 // Add a bit more than minimum
+	for i := 0; i < candlesToAdd; i++ {
 		btcCandle := models.Candle{
 			Symbol:    "BTCUSDT",
-			Timestamp: baseTime.Add(time.Duration(-RSLookbackMinutes+i) * time.Minute),
+			Timestamp: baseTime.Add(time.Duration(-candlesToAdd+i) * time.Minute),
 			Open:      50000.0,
 			High:      50100.0,
 			Low:       49900.0,
@@ -137,15 +138,15 @@ func TestProcessCandle(t *testing.T) {
 	}
 
 	// Check BTC candles stored
-	if len(engine.btcCandles) != RSLookbackMinutes {
-		t.Errorf("BTC candles count = %v, want %v", len(engine.btcCandles), RSLookbackMinutes)
+	if len(engine.btcCandles) != candlesToAdd {
+		t.Errorf("BTC candles count = %v, want %v", len(engine.btcCandles), candlesToAdd)
 	}
 
 	// Add test asset candles
-	for i := 0; i < SupportLookback; i++ {
+	for i := 0; i < candlesToAdd; i++ {
 		candle := models.Candle{
 			Symbol:    "TESTUSDT",
-			Timestamp: baseTime.Add(time.Duration(-SupportLookback+i) * time.Minute),
+			Timestamp: baseTime.Add(time.Duration(-candlesToAdd+i) * time.Minute),
 			Open:      100.0,
 			High:      101.0,
 			Low:       99.0,
@@ -156,7 +157,7 @@ func TestProcessCandle(t *testing.T) {
 	}
 
 	// Check asset candles stored
-	if len(engine.candleCache["TESTUSDT"]) != SupportLookback {
-		t.Errorf("TESTUSDT candles count = %v, want %v", len(engine.candleCache["TESTUSDT"]), SupportLookback)
+	if len(engine.candleCache["TESTUSDT"]) != candlesToAdd {
+		t.Errorf("TESTUSDT candles count = %v, want %v", len(engine.candleCache["TESTUSDT"]), candlesToAdd)
 	}
 }

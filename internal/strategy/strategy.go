@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	MaxCandlesInMemory = 240 // 4 hours of 1-minute candles
-	RSLookbackMinutes  = 240 // 4 hours for RS calculation
-	SupportLookback    = 60  // 60 minutes for support detection
+	MaxCandlesInMemory = 240 // 4 hours of 1-minute candles (keep for history)
+	RSLookbackMinutes  = 60  // 1 hour for RS calculation (was 4h, too conservative)
+	MinRSLookback      = 30  // Minimum 30 minutes to start analysis
+	SupportLookback    = 30  // 30 minutes for support detection (was 60m)
 	VolumeAvgWindow    = 20  // 20 candles for volume average
 )
 
@@ -54,8 +55,30 @@ func (e *Engine) ProcessCandle(candle models.Candle) {
 	}
 
 	// Skip analysis if not enough data
-	if len(e.candleCache[candle.Symbol]) < SupportLookback || len(e.btcCandles) < RSLookbackMinutes {
+	// Use minimum 30 minutes to start, but prefer 60 minutes for better accuracy
+	minDataPoints := MinRSLookback
+	assetDataPoints := len(e.candleCache[candle.Symbol])
+	btcDataPoints := len(e.btcCandles)
+
+	if assetDataPoints < minDataPoints || btcDataPoints < minDataPoints {
+		// Log progress every 10 candles
+		if assetDataPoints%10 == 0 {
+			log.Debug().
+				Str("symbol", candle.Symbol).
+				Int("asset_candles", assetDataPoints).
+				Int("btc_candles", btcDataPoints).
+				Int("needed", minDataPoints).
+				Msg("collecting data before analysis starts")
+		}
 		return
+	}
+
+	// Log when we start analyzing a new symbol for the first time
+	if assetDataPoints == minDataPoints {
+		log.Info().
+			Str("symbol", candle.Symbol).
+			Int("candles", assetDataPoints).
+			Msg("started analysis for symbol - enough data collected")
 	}
 
 	// Analyze for breakdown signal
@@ -137,16 +160,26 @@ func (e *Engine) calculateRS(symbol string) float64 {
 	}
 
 	assetCandles := e.candleCache[symbol]
-	if len(assetCandles) < RSLookbackMinutes || len(e.btcCandles) < RSLookbackMinutes {
+	if len(assetCandles) < MinRSLookback || len(e.btcCandles) < MinRSLookback {
 		return 0
 	}
 
-	// Get price change over 4 hours
-	assetOld := assetCandles[len(assetCandles)-RSLookbackMinutes].Close
+	// Adaptive lookback: use what we have, but prefer RSLookbackMinutes (60m)
+	// If we only have 30-60 minutes of data, use it instead of waiting for full 60m
+	lookback := RSLookbackMinutes
+	if len(assetCandles) < lookback {
+		lookback = len(assetCandles)
+	}
+	if len(e.btcCandles) < lookback {
+		lookback = len(e.btcCandles)
+	}
+
+	// Get price change over the lookback period
+	assetOld := assetCandles[len(assetCandles)-lookback].Close
 	assetNew := assetCandles[len(assetCandles)-1].Close
 	assetChange := ((assetNew - assetOld) / assetOld) * 100
 
-	btcOld := e.btcCandles[len(e.btcCandles)-RSLookbackMinutes].Close
+	btcOld := e.btcCandles[len(e.btcCandles)-lookback].Close
 	btcNew := e.btcCandles[len(e.btcCandles)-1].Close
 	btcChange := ((btcNew - btcOld) / btcOld) * 100
 
