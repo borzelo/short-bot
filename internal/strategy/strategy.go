@@ -277,8 +277,9 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// 6. Detect support level
-	support := e.detectSupport(buffer)
+	// 6. Detect support level (v1.4.0: consolidation detection with fractal fallback)
+	candles := buffer.LastN(buffer.Len())
+	support := DetectSupport(candles)
 	if support == nil {
 		return nil
 	}
@@ -288,7 +289,16 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// 8. Calculate score
+	// 8. Confirm no bounceback (v1.4.0)
+	if !ConfirmNoBounceback(candles, support.Price) {
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("support", support.Price).
+			Msg("bounceback detected, skipping signal")
+		return nil
+	}
+
+	// 9. Calculate score
 	score := e.calculateScore(rs, volumeRatio, support, currentCandle, fundingRate, closePosition)
 
 	// Check minimum score threshold
@@ -311,12 +321,13 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		ScoreRS:         rs,
 		ScoreTotal:      score,
 		Meta: map[string]interface{}{
-			"volume_ratio":        volumeRatio,
-			"funding_rate":        fundingRate,
-			"close_position":      closePosition,
-			"support_age_minutes": time.Since(support.Timestamp).Minutes(),
-			"support_touch_count": support.TouchCount,
-			"avg_volume":          avgVolume,
+			"volume_ratio":           volumeRatio,
+			"funding_rate":           fundingRate,
+			"close_position":         closePosition,
+			"support_age_minutes":    time.Since(support.Timestamp).Minutes(),
+			"support_touch_count":    support.TouchCount,
+			"is_consolidation_break": support.IsConsolidation,
+			"avg_volume":             avgVolume,
 		},
 	}
 }
@@ -365,45 +376,8 @@ func (e *Engine) calculateRS(symbol string) (float64, error) {
 	return assetChange - btcChange, nil
 }
 
-func (e *Engine) detectSupport(buffer *RingBuffer) *models.SupportLevel {
-	if buffer.Len() < SupportLookback {
-		return nil
-	}
-
-	recentCandles := buffer.LastN(SupportLookback)
-
-	// Find fractal lows: Low[i] < Low[i-2...i+2]
-	var fractals []models.SupportLevel
-
-	for i := 2; i < len(recentCandles)-2; i++ {
-		low := recentCandles[i].Low
-		isFractal := true
-
-		for j := i - 2; j <= i+2; j++ {
-			if j == i {
-				continue
-			}
-			if recentCandles[j].Low < low {
-				isFractal = false
-				break
-			}
-		}
-
-		if isFractal {
-			fractals = append(fractals, models.SupportLevel{
-				Price:     low,
-				Timestamp: recentCandles[i].Timestamp,
-			})
-		}
-	}
-
-	if len(fractals) == 0 {
-		return nil
-	}
-
-	// Return the most recent fractal low
-	return &fractals[len(fractals)-1]
-}
+// detectSupport removed in v1.4.0 - now using DetectSupport() from support_detector.go
+// which includes consolidation detection with fractal fallback
 
 func (e *Engine) calculateAvgVolume(buffer *RingBuffer) float64 {
 	window := VolumeAvgWindow
@@ -492,6 +466,20 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 		if ticker24h.Price24hPcnt > PumpRolloverThreshold {
 			score += PumpRolloverBonus
 		}
+	}
+
+	// Support touch count bonus (up to 15 points) - v1.4.0
+	// Multiple touches of support level = stronger level
+	if support.TouchCount >= 3 {
+		score += 15
+	} else if support.TouchCount >= 2 {
+		score += 10
+	}
+
+	// Consolidation breakout bonus (10 points) - v1.4.0
+	// Consolidation breakdowns are stronger than simple fractal low breakdowns
+	if support.IsConsolidation {
+		score += 10
 	}
 
 	// Cap at 100

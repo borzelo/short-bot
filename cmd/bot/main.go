@@ -17,10 +17,17 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const (
+	// v1.4.0: Minimum turnover for instrument selection
+	MinTurnoverUSD = 5_000_000 // $5M/24h minimum
+	// v1.4.0: Number of weak assets to monitor
+	TopWeakCount = 50
+)
+
 func main() {
 	setupLogger()
 
-	log.Info().Msg("🚀 Starting Millionaire Bot")
+	log.Info().Msg("🚀 Starting Millionaire Bot v1.4.0")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -42,33 +49,61 @@ func main() {
 	// Initialize ByBit API client
 	apiClient := bybit.NewAPIClient(cfg.ByBitAPIURL, cfg.ByBitAPIAltURL)
 
-	// Fetch mid-cap USDT futures
-	assets, err := apiClient.GetTop100USDTFutures()
+	// v1.4.0: Get ALL USDT Perp symbols with minimum liquidity
+	log.Info().Float64("min_turnover", MinTurnoverUSD).Msg("fetching all instruments with minimum turnover")
+	allSymbols, err := apiClient.GetAllInstruments(MinTurnoverUSD)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to fetch mid-cap USDT futures")
+		log.Warn().Err(err).Msg("failed to fetch all instruments, using fallback")
+		// Fallback to old method
+		assets, _ := apiClient.GetTop100USDTFutures()
+		allSymbols = extractSymbols(assets)
+	}
+	log.Info().Int("count", len(allSymbols)).Msg("loaded instruments for weakness scanning")
+
+	// v1.4.0: Initialize WeaknessScanner
+	weaknessScanner := strategy.NewWeaknessScanner(apiClient)
+
+	// v1.4.0: Scan all symbols and calculate weakness scores
+	log.Info().Msg("performing initial weakness scan (this may take a few minutes)...")
+	if err := weaknessScanner.ScanAll(allSymbols); err != nil {
+		log.Warn().Err(err).Msg("weakness scan failed, using all symbols")
 	}
 
-	log.Info().Int("count", len(assets)).Msg("loaded mid-cap USDT futures")
+	// v1.4.0: Get top weak symbols for monitoring
+	weakScores := weaknessScanner.GetTopWeak(TopWeakCount)
+	symbols := strategy.GetSymbolsFromScores(weakScores)
 
-	// Save assets to database
-	for _, asset := range assets {
-		if err := store.SaveAsset(ctx, &asset); err != nil {
-			log.Error().Err(err).Str("symbol", asset.Symbol).Msg("failed to save asset")
-		}
-	}
-
-	// Extract symbol list for WebSocket subscription
-	symbols := extractSymbols(assets)
+	// Log selected weak symbols
+	log.Info().
+		Int("selected", len(symbols)).
+		Int("total_scanned", len(allSymbols)).
+		Msg("selected weakest assets for monitoring")
 
 	// Ensure BTCUSDT is included for RS calculation
 	symbols = ensureBTCIncluded(symbols)
+
+	// Save selected assets to database
+	for _, symbol := range symbols {
+		asset := models.Asset{Symbol: symbol, IsTradable: true}
+		if err := store.SaveAsset(ctx, &asset); err != nil {
+			log.Debug().Err(err).Str("symbol", symbol).Msg("failed to save asset")
+		}
+	}
 
 	// Initialize strategy engine
 	engine := strategy.NewEngine()
 
 	// Combined ticker data updater (v1.3.0: single API call for funding + 24h stats)
 	updateTickerData := func() {
-		data, _ := apiClient.GetTickerData(symbols)
+		data, err := apiClient.GetTickerData(symbols)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to fetch ticker data")
+			return
+		}
+		if data == nil {
+			log.Warn().Msg("ticker data is nil")
+			return
+		}
 		engine.UpdateFundingRates(data.FundingRates)
 		engine.UpdateTicker24hStats(data.Ticker24hStats)
 	}
@@ -94,10 +129,20 @@ func main() {
 	go processCandles(ctx, engine, wsClient)
 	go processSignals(ctx, engine, store, notifier)
 
-	// Start periodic tasks
-	go runPeriodicTasks(ctx, engine, updateTickerData)
+	// v1.4.0: Weakness scanner update function (hourly)
+	updateWeaknessScores := func() {
+		log.Info().Msg("updating weakness scores...")
+		if err := weaknessScanner.ScanAll(allSymbols); err != nil {
+			log.Warn().Err(err).Msg("weakness scan update failed")
+		}
+		// Note: Dynamic WebSocket subscription update not implemented yet
+		// This requires changes to WSClient to support UpdateSubscriptions()
+	}
 
-	log.Info().Msg("✅ Bot is running and monitoring markets")
+	// Start periodic tasks
+	go runPeriodicTasks(ctx, engine, updateTickerData, updateWeaknessScores)
+
+	log.Info().Msg("✅ Bot is running and monitoring weak assets")
 
 	// Wait for shutdown signal
 	<-sigChan
@@ -129,7 +174,7 @@ func ensureBTCIncluded(symbols []string) []string {
 			return symbols
 		}
 	}
-	log.Warn().Msg("BTCUSDT not in top 100, adding it for RS calculation")
+	log.Warn().Msg("BTCUSDT not in selected symbols, adding it for RS calculation")
 	return append(symbols, "BTCUSDT")
 }
 
@@ -168,11 +213,13 @@ func processSignals(ctx context.Context, engine *strategy.Engine, store *db.Stor
 	}
 }
 
-func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTickerData func()) {
+func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTickerData func(), updateWeaknessScores func()) {
 	statsTicker := time.NewTicker(5 * time.Minute)
-	tickerDataTicker := time.NewTicker(5 * time.Minute) // v1.3.0: single API call for funding + 24h stats
+	tickerDataTicker := time.NewTicker(5 * time.Minute)
+	weaknessTicker := time.NewTicker(1 * time.Hour) // v1.4.0: hourly weakness scan
 	defer statsTicker.Stop()
 	defer tickerDataTicker.Stop()
+	defer weaknessTicker.Stop()
 
 	for {
 		select {
@@ -183,6 +230,8 @@ func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTicker
 			log.Info().Interface("stats", stats).Msg("engine statistics")
 		case <-tickerDataTicker.C:
 			updateTickerData()
+		case <-weaknessTicker.C:
+			updateWeaknessScores()
 		}
 	}
 }

@@ -892,6 +892,72 @@ log.Info().Msg("👋 Bot stopped")
 
 ## История изменений
 
+### v1.4.0 (26 января 2026)
+
+**ФАЗА 1: Система отбора слабых активов**
+
+Полностью переделана логика выбора инструментов для мониторинга:
+- ✅ **WeaknessScore** — новая структура с метриками слабости актива (RS7d, RS24h, MA50, MA200, VolumeDecline)
+- ✅ **WeaknessScorer** — расчёт скора слабости (0-100) на основе 6 факторов
+- ✅ **WeaknessScanner** — сканер для выбора топ-50 слабых активов
+- ✅ **GetKlines()** — получение исторических свечей (D, 4h) для расчёта MA и RS
+- ✅ **GetAllInstruments()** — получение всех инструментов с минимальным turnover $5M
+
+**Критерии WeaknessScore:**
+| Фактор | Условие | Баллы |
+|--------|---------|-------|
+| RS7d | < -20% | +30 |
+| RS7d | < -10% | +20 |
+| RS7d | < -5% | +10 |
+| RS24h | < -10% | +15 |
+| RS24h | < -5% | +10 |
+| RS24h | < -2% | +5 |
+| PriceVsMA50 | < -20% | +20 |
+| PriceVsMA50 | < -10% | +15 |
+| PriceVsMA50 | < -5% | +10 |
+| PriceVsMA200 | < -30% | +15 |
+| PriceVsMA200 | < -15% | +10 |
+| VolumeDecline | < -30% | +10 |
+| VolumeDecline | < -15% | +5 |
+| FundingRate | > 0.05% | +10 |
+| FundingRate | > 0.01% | +5 |
+
+**ФАЗА 2: Улучшение Support Detection**
+
+- ✅ **DetectConsolidation()** — детекция зон консолидации (range < 3%, 60 свечей)
+- ✅ **DetectFractalLow()** — fallback на фрактальные минимумы
+- ✅ **ConfirmNoBounceback()** — проверка buyback wick текущей свечи пробоя
+- ✅ **TouchCount** — подсчёт касаний уровня поддержки
+- ✅ **IsConsolidation** — флаг пробоя консолидации (сильнее фрактала)
+
+**Исправленные баги и оптимизации:**
+- ✅ **weakness_scanner.go**: Исправлен возврат `nil, nil` → корректная ошибка
+- ✅ **weakness_scanner.go**: Добавлен rate limiting (100ms между API запросами)
+- ✅ **breakdown_analyzer.go**: Исправлена логика ConfirmNoBounceback (проверка wick текущей свечи)
+- ✅ **support_detector.go**: Обработка edge case с нулевыми ценами в findHighLow()
+- ✅ **main.go**: Защита от nil pointer dereference в updateTickerData()
+
+**Новые бонусы скоринга:**
+| Фактор | Условие | Баллы |
+|--------|---------|-------|
+| Support Touches | >= 3 касания | +15 |
+| Support Touches | >= 2 касания | +10 |
+| Consolidation Break | IsConsolidation=true | +10 |
+
+**Новые файлы:**
+- `internal/models/weakness.go` — WeaknessScore, HistoricalCandle
+- `internal/strategy/weakness_scorer.go` — расчёт скора слабости
+- `internal/strategy/weakness_scanner.go` — сканер слабых активов
+- `internal/strategy/support_detector.go` — детектор консолидации
+- `internal/strategy/breakdown_analyzer.go` — проверка bounceback
+
+**Изменения в архитектуре:**
+- Отбор символов: mid-cap по объёму → топ-50 слабых по WeaknessScore
+- Периодическое обновление WeaknessScore каждый час
+- Support detection с приоритетом консолидации
+
+---
+
 ### v1.3.0 (26 января 2026)
 
 **Новые фильтры и бонусы**:
@@ -941,5 +1007,5 @@ log.Info().Msg("👋 Bot stopped")
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.3.0
+**Версия бота**: 1.4.0
 **Автор архитектуры**: AI-assisted development

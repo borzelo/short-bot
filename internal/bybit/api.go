@@ -59,6 +59,17 @@ type instrumentResponse struct {
 	} `json:"result"`
 }
 
+// klineResponse represents the response from GET /v5/market/kline (v1.4.0)
+type klineResponse struct {
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Result  struct {
+		Category string     `json:"category"`
+		Symbol   string     `json:"symbol"`
+		List     [][]string `json:"list"` // [[timestamp, open, high, low, close, volume, turnover], ...]
+	} `json:"result"`
+}
+
 func NewAPIClient(baseURL string, altBaseURL string) *APIClient {
 	return &APIClient{
 		baseURL:    baseURL,
@@ -426,4 +437,136 @@ func (c *APIClient) getInstrumentInfo(symbols []string) ([]models.Asset, error) 
 	}
 
 	return assets, nil
+}
+
+// GetAllInstruments returns all USDT perpetuals with minimum turnover (v1.4.0)
+// Used for WeaknessScanner to select fundamentally weak assets
+func (c *APIClient) GetAllInstruments(minTurnoverUSD float64) ([]string, error) {
+	tickers, err := c.fetchTickersFromAPI()
+	if err != nil {
+		return nil, fmt.Errorf("fetch tickers: %w", err)
+	}
+
+	var symbols []string
+	for _, ticker := range tickers {
+		// Only USDT perpetuals
+		if len(ticker.Symbol) < 4 || ticker.Symbol[len(ticker.Symbol)-4:] != "USDT" {
+			continue
+		}
+
+		turnover, err := strconv.ParseFloat(ticker.Turnover24h, 64)
+		if err != nil {
+			continue
+		}
+
+		if turnover >= minTurnoverUSD {
+			symbols = append(symbols, ticker.Symbol)
+		}
+	}
+
+	log.Info().
+		Int("count", len(symbols)).
+		Float64("min_turnover", minTurnoverUSD).
+		Msg("fetched all instruments with minimum turnover")
+
+	return symbols, nil
+}
+
+// GetKlines fetches historical candles for a symbol (v1.4.0)
+// Intervals: "1" (1m), "5" (5m), "15" (15m), "60" (1h), "240" (4h), "D" (daily), "W" (weekly)
+// Used for MA calculation, RS7d, RS24h
+func (c *APIClient) GetKlines(symbol string, interval string, limit int) ([]models.HistoricalCandle, error) {
+	urlsToTry := c.getURLsToTry()
+
+	var lastErr error
+	for _, baseURL := range urlsToTry {
+		candles, err := c.fetchKlinesFromURL(baseURL, symbol, interval, limit)
+		if err == nil {
+			return candles, nil
+		}
+		lastErr = err
+	}
+
+	return nil, fmt.Errorf("all API endpoints failed for klines: %w", lastErr)
+}
+
+func (c *APIClient) getURLsToTry() []string {
+	urls := []string{c.baseURL}
+	if c.altBaseURL != "" && c.altBaseURL != c.baseURL {
+		urls = append(urls, c.altBaseURL)
+	}
+	for _, alt := range alternativeAPIs {
+		if alt != c.baseURL && alt != c.altBaseURL {
+			urls = append(urls, alt)
+		}
+	}
+	return urls
+}
+
+func (c *APIClient) fetchKlinesFromURL(baseURL, symbol, interval string, limit int) ([]models.HistoricalCandle, error) {
+	url := fmt.Sprintf("%s/v5/market/kline?category=linear&symbol=%s&interval=%s&limit=%d",
+		baseURL, symbol, interval, limit)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	// Add headers to avoid Cloudflare blocking
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch klines: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("api returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	var klineResp klineResponse
+	if err := json.Unmarshal(body, &klineResp); err != nil {
+		return nil, fmt.Errorf("unmarshal klines: %w", err)
+	}
+
+	if klineResp.RetCode != 0 {
+		return nil, fmt.Errorf("bybit api error: %s", klineResp.RetMsg)
+	}
+
+	// Parse klines - ByBit returns newest first, we need oldest first
+	candles := make([]models.HistoricalCandle, 0, len(klineResp.Result.List))
+	for i := len(klineResp.Result.List) - 1; i >= 0; i-- {
+		item := klineResp.Result.List[i]
+		if len(item) < 7 {
+			continue
+		}
+
+		timestamp, _ := strconv.ParseInt(item[0], 10, 64)
+		open, _ := strconv.ParseFloat(item[1], 64)
+		high, _ := strconv.ParseFloat(item[2], 64)
+		low, _ := strconv.ParseFloat(item[3], 64)
+		closePrice, _ := strconv.ParseFloat(item[4], 64)
+		volume, _ := strconv.ParseFloat(item[5], 64)
+		turnover, _ := strconv.ParseFloat(item[6], 64)
+
+		candles = append(candles, models.HistoricalCandle{
+			Symbol:    symbol,
+			Timestamp: time.UnixMilli(timestamp),
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     closePrice,
+			Volume:    volume,
+			Turnover:  turnover,
+		})
+	}
+
+	return candles, nil
 }

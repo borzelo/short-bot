@@ -35,11 +35,15 @@ type Signal struct {
 	Meta             map[string]interface{}
 }
 
-// SupportLevel represents a detected support level
+// SupportLevel represents a detected support level (v1.4.0 enhanced)
 type SupportLevel struct {
-	Price     float64
-	Timestamp time.Time
-	TouchCount int
+	Price           float64   // Support price level
+	Timestamp       time.Time // When the level was formed (FormationTime)
+	TouchCount      int       // How many times price touched this level
+	VolumeAtLevel   float64   // Average volume at touches
+	RangeHigh       float64   // Upper bound of consolidation zone
+	RangeLow        float64   // Lower bound (= Price)
+	IsConsolidation bool      // Whether this is a consolidation breakout
 }
 
 // MarketData holds aggregated market information for analysis
