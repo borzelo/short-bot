@@ -33,16 +33,22 @@ const (
 	FundingPositive     = 0.01  // Positive funding threshold for bonus
 	SupportAgeBonus     = 20.0  // Minutes for support age bonus
 	MinScoreForSignal   = 50    // Minimum score to generate signal
+
+	// v1.3.0: Volatility filter and Pump Rollover
+	MinVolatility24h      = 0.03  // Minimum 24h volatility (3%) to avoid dead coins
+	PumpRolloverThreshold = 0.05  // 24h price change > 5% for pump bonus
+	PumpRolloverBonus     = 15    // Bonus points for pump rollover scenario
 )
 
 // Engine processes candles and generates signals
 type Engine struct {
-	mu           sync.RWMutex
-	candleCache  map[string]*RingBuffer // symbol -> ring buffer of candles
-	btcBuffer    *RingBuffer            // BTC candles for RS calculation
-	fundingRates map[string]float64     // symbol -> funding rate (percent)
-	signalChan   chan *models.Signal
-	lastSignal   map[string]time.Time   // symbol -> last signal time (cooldown)
+	mu             sync.RWMutex
+	candleCache    map[string]*RingBuffer          // symbol -> ring buffer of candles
+	btcBuffer      *RingBuffer                     // BTC candles for RS calculation
+	fundingRates   map[string]float64              // symbol -> funding rate (percent)
+	ticker24hStats map[string]*models.Ticker24hStats // symbol -> 24h price statistics (v1.3.0)
+	signalChan     chan *models.Signal
+	lastSignal     map[string]time.Time            // symbol -> last signal time (cooldown)
 }
 
 // RingBuffer is a memory-efficient circular buffer for candles
@@ -121,11 +127,12 @@ func (rb *RingBuffer) LastN(n int) []models.Candle {
 
 func NewEngine() *Engine {
 	return &Engine{
-		candleCache:  make(map[string]*RingBuffer),
-		btcBuffer:    NewRingBuffer(MaxCandlesInMemory),
-		fundingRates: make(map[string]float64),
-		signalChan:   make(chan *models.Signal, 100),
-		lastSignal:   make(map[string]time.Time),
+		candleCache:    make(map[string]*RingBuffer),
+		btcBuffer:      NewRingBuffer(MaxCandlesInMemory),
+		fundingRates:   make(map[string]float64),
+		ticker24hStats: make(map[string]*models.Ticker24hStats),
+		signalChan:     make(chan *models.Signal, 100),
+		lastSignal:     make(map[string]time.Time),
 	}
 }
 
@@ -211,6 +218,23 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	}
 
 	currentCandle := buffer.Last()
+
+	// 0. Volatility Filter (v1.3.0) - reject dead/stable coins early
+	// Formula: NDR = (High24h - Low24h) / LastPrice
+	// Threshold: 3% minimum volatility
+	ticker24h := e.ticker24hStats[symbol]
+	if ticker24h != nil && ticker24h.LastPrice > 0 {
+		dailyRange := ticker24h.HighPrice24h - ticker24h.LowPrice24h
+		volatility := dailyRange / ticker24h.LastPrice
+		if volatility < MinVolatility24h {
+			log.Debug().
+				Str("symbol", symbol).
+				Float64("volatility", volatility).
+				Float64("threshold", MinVolatility24h).
+				Msg("signal rejected: volatility too low (dead coin)")
+			return nil // REJECT: Asset is too stable/dead, not worth trading fees
+		}
+	}
 
 	// 1. Calculate Relative Strength (RS)
 	rs, err := e.calculateRS(symbol)
@@ -461,6 +485,15 @@ func (e *Engine) calculateScore(rs float64, volumeRatio float64, support *models
 		}
 	}
 
+	// Pump Rollover scoring (15 points) - v1.3.0
+	// If the coin is up > 5% in the last 24h, but we have a breakdown signal locally,
+	// it indicates a potential reversal of a pump ("Hangover" effect). High-quality setup.
+	if ticker24h := e.ticker24hStats[currentCandle.Symbol]; ticker24h != nil {
+		if ticker24h.Price24hPcnt > PumpRolloverThreshold {
+			score += PumpRolloverBonus
+		}
+	}
+
 	// Cap at 100
 	if score > 100 {
 		score = 100
@@ -481,6 +514,19 @@ func (e *Engine) UpdateFundingRates(rates map[string]float64) {
 	for symbol, rate := range rates {
 		e.fundingRates[symbol] = rate
 	}
+}
+
+// UpdateTicker24hStats updates 24h price statistics for volatility filter and pump detection (v1.3.0)
+func (e *Engine) UpdateTicker24hStats(stats map[string]*models.Ticker24hStats) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.ticker24hStats = make(map[string]*models.Ticker24hStats, len(stats))
+	for symbol, stat := range stats {
+		e.ticker24hStats[symbol] = stat
+	}
+
+	log.Debug().Int("count", len(stats)).Msg("ticker 24h stats updated")
 }
 
 func (e *Engine) GetStats() map[string]interface{} {

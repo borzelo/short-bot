@@ -51,3 +51,12 @@ type MarketData struct {
 	AvgVolume     float64 // Average volume over last N candles
 	Support       *SupportLevel
 }
+
+// Ticker24hStats holds 24h price statistics for volatility filter and pump detection
+type Ticker24hStats struct {
+	Symbol       string
+	HighPrice24h float64 // Highest price in last 24h
+	LowPrice24h  float64 // Lowest price in last 24h
+	Price24hPcnt float64 // 24h price change percentage (e.g., 0.05 = +5%)
+	LastPrice    float64 // Current/last price
+}

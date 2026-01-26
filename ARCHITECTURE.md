@@ -42,6 +42,7 @@
                     ┌──────────────────┐
                     │  Strategy Engine │
                     │                  │
+                    │ • Volatility Flt │  ← v1.3.0
                     │ • RS Calculation │
                     │ • Funding Filter │
                     │ • Support Detect │
@@ -49,6 +50,7 @@
                     │ • Volume Check   │
                     │ • Signal Cooldown│
                     │ • Score Calc     │
+                    │ • Pump Rollover  │  ← v1.3.0
                     └──────────────────┘
                               │
                               ▼
@@ -81,8 +83,8 @@ go processCandles(ctx, engine, wsClient)
 // 2. Обработка сигналов (БД + Telegram)
 go processSignals(ctx, engine, store, notifier)
 
-// 3. Периодические задачи (статистика + funding rates)
-go runPeriodicTasks(ctx, engine, updateFundingRates)
+// 3. Периодические задачи (статистика + ticker data)
+go runPeriodicTasks(ctx, engine, updateTickerData)
 ```
 
 > **Примечание**: Реконнект WebSocket теперь управляется внутри `WSClient` (SRP принцип).
@@ -111,13 +113,14 @@ go runPeriodicTasks(ctx, engine, updateFundingRates)
 
 #### 3.1 **API Client** (`api.go`)
 
-**Роль**: Получение списка торгуемых инструментов и funding rates.
+**Роль**: Получение списка торгуемых инструментов, funding rates и 24h статистики.
 
 **Функционал**:
 - Получение всех USDT Perp тикеров и сортировка по turnover 24h
 - Исключение Top-15 по объёму и выбор следующих 100 (Rank 16-116)
 - Фильтр ликвидности: turnover >= $10M/24h
 - Получение funding rates через `/v5/market/tickers`
+- **v1.3.0**: Получение 24h статистики (`highPrice24h`, `lowPrice24h`, `price24hPcnt`) для фильтра волатильности и Pump Rollover
 - **Multi-endpoint fallback** при 403 ошибке (Cloudflare blocking)
 - Возврат базовых параметров инструментов
 
@@ -502,6 +505,35 @@ Volume Ratio = Current Volume / Average Volume
 
 ---
 
+### 7. **Volatility Filter (v1.3.0)**
+
+**Идея**: Отсекать "мёртвые" или стабильные активы, которые не имеют достаточной волатильности для прибыльной торговли.
+
+**Формула — Normalized Daily Range (NDR)**:
+```
+NDR = (High24h - Low24h) / CurrentPrice
+```
+
+**Триггер**:
+```
+if NDR < 0.03 (3%)  →  сигнал отбрасывается
+```
+
+**Логика**: Активы с дневной волатильностью менее 3% не покроют комиссии и не дадут значимой прибыли.
+
+**Пример**:
+```
+High24h: $100, Low24h: $95, CurrentPrice: $97
+NDR = (100 - 95) / 97 = 5.15%  ✅ Актив достаточно волатилен
+
+High24h: $50.5, Low24h: $49.5, CurrentPrice: $50
+NDR = (50.5 - 49.5) / 50 = 2%  ❌ Слишком стабильный, пропускаем
+```
+
+**Обновление**: 24h статистика обновляется каждые 5 минут.
+
+---
+
 ## Система скоринга
 
 **Диапазон**: 0-100 баллов
@@ -570,6 +602,18 @@ if closePosition < 0.1 {
 }
 ```
 
+#### 7. **Pump Rollover (v1.3.0)** (15 баллов)
+
+```go
+// "Hangover" effect: актив вырос > 5% за 24h, но локально пробивает поддержку
+// Это индикатор разворота памп-движения — трейдеры застряли в лонгах
+if ticker24h.Price24hPcnt > 0.05 {  // > +5%
+    score += 15
+}
+```
+
+> **Логика**: Если актив значительно вырос за сутки (+5% и более), но сейчас пробивает локальную поддержку, это сильный сигнал на разворот — day-трейдеры "застряли" в длинных позициях.
+
 ---
 
 ### Итоговая таблица скоринга
@@ -578,13 +622,14 @@ if closePosition < 0.1 {
 |--------|---------|-------|
 | **Слабость** | RS < -3% | +30 |
 | | RS < -5% | +10 (бонус) |
-| **Объём** | Volume >= 1.5x | +10 (NEW!) |
+| **Объём** | Volume >= 1.5x | +10 |
 | | Volume >= 2x | +10 |
 | | Volume >= 3x | +10 (бонус) |
 | **Возраст уровня** | Age > 20 min | +20 |
 | **Дивергенция** | BTC↑ Asset↓ | +10 |
 | **Funding** | Funding > 0.01% | +20 |
 | **Close Position** | Close < 10% свечи | +10 |
+| **Pump Rollover** | 24h Change > +5% | +15 (v1.3.0) |
 | | | |
 | **Максимум** | | **100 (cap)** |
 
@@ -847,6 +892,28 @@ log.Info().Msg("👋 Bot stopped")
 
 ## История изменений
 
+### v1.3.0 (26 января 2026)
+
+**Новые фильтры и бонусы**:
+- ✅ **Volatility Filter**: Отсечение "мёртвых" активов с NDR < 3%
+- ✅ **Pump Rollover Bonus**: +15 баллов если 24h Change > +5% (разворот пампа)
+
+**Новый функционал**:
+- ✅ `GetTickerData()` — объединённый метод для получения funding rates + 24h статистики в **одном API запросе**
+- ✅ `UpdateTicker24hStats()` — периодическое обновление 24h данных в Engine
+- ✅ Структура `Ticker24hStats` и `TickerData` в models/bybit
+
+**Изменения в Pipeline**:
+- Volatility Filter выполняется в начале analyzeBreakdown() (early exit для мёртвых активов)
+- Pump Rollover Bonus добавлен в calculateScore()
+- Debug логирование при отклонении по volatility filter
+
+**Оптимизации производительности**:
+- ✅ **Single API Call**: funding rates и 24h stats теперь получаются одним HTTP запросом вместо двух
+- ✅ Убраны дублирующиеся тикеры в runPeriodicTasks()
+
+---
+
 ### v1.2.0 (26 января 2026)
 
 **Исправленные баги**:
@@ -874,5 +941,5 @@ log.Info().Msg("👋 Bot stopped")
 ---
 
 **Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.2.0
+**Версия бота**: 1.3.0
 **Автор архитектуры**: AI-assisted development

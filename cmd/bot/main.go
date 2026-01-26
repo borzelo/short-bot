@@ -66,14 +66,15 @@ func main() {
 	// Initialize strategy engine
 	engine := strategy.NewEngine()
 
-	// Funding rates updater
-	updateFundingRates := func() {
-		rates, _ := apiClient.GetFundingRates(symbols)
-		engine.UpdateFundingRates(rates)
+	// Combined ticker data updater (v1.3.0: single API call for funding + 24h stats)
+	updateTickerData := func() {
+		data, _ := apiClient.GetTickerData(symbols)
+		engine.UpdateFundingRates(data.FundingRates)
+		engine.UpdateTicker24hStats(data.Ticker24hStats)
 	}
 
-	// Fetch funding rates at startup
-	updateFundingRates()
+	// Fetch ticker data at startup
+	updateTickerData()
 
 	// Initialize Telegram notifier
 	notifier := telegram.NewNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
@@ -94,7 +95,7 @@ func main() {
 	go processSignals(ctx, engine, store, notifier)
 
 	// Start periodic tasks
-	go runPeriodicTasks(ctx, engine, updateFundingRates)
+	go runPeriodicTasks(ctx, engine, updateTickerData)
 
 	log.Info().Msg("✅ Bot is running and monitoring markets")
 
@@ -167,11 +168,11 @@ func processSignals(ctx context.Context, engine *strategy.Engine, store *db.Stor
 	}
 }
 
-func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateFundingRates func()) {
+func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTickerData func()) {
 	statsTicker := time.NewTicker(5 * time.Minute)
-	fundingTicker := time.NewTicker(5 * time.Minute)
+	tickerDataTicker := time.NewTicker(5 * time.Minute) // v1.3.0: single API call for funding + 24h stats
 	defer statsTicker.Stop()
-	defer fundingTicker.Stop()
+	defer tickerDataTicker.Stop()
 
 	for {
 		select {
@@ -180,8 +181,8 @@ func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateFundin
 		case <-statsTicker.C:
 			stats := engine.GetStats()
 			log.Info().Interface("stats", stats).Msg("engine statistics")
-		case <-fundingTicker.C:
-			updateFundingRates()
+		case <-tickerDataTicker.C:
+			updateTickerData()
 		}
 	}
 }

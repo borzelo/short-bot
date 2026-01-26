@@ -1,81 +1,75 @@
 
-# SPECIFICATION: Strategy Logic Upgrade (v1.1)
+# SPECIFICATION: Strategy Logic Upgrade (v1.3.0)
 
-**Context:** Upgrade the existing Go trading bot ("Millionaire Bot") to align with the "OBVAL" strategy.
-**Goal:** Shift focus from Top-Tier assets to volatile Mid-Caps and add protection against "short squeezes" and "buybacks".
+**Context:** Upgrade "Millionaire Bot" from v1.2 to v1.3.
+**Goal:** Implement "Pump Rollover" logic (shorting assets that are green on the daily timeframe but breaking down locally) and a "Volatility Filter" to avoid dead assets.
 
 ## 1. Module: Market Data (`internal/bybit`)
 
-### 1.1 Filter Asset Universe
+### 1.1 Ensure Ticker Data Availability
 
-**File:** `internal/bybit/api.go`
-**Action:** Modify the symbol fetching logic to exclude "Heavyweights".
-**Logic:**
+**File:** `internal/bybit/api.go` / `models/ticker.go`
+**Action:** Verify that the `Ticker` struct and the API response parsing include the following fields from ByBit V5 `GET /v5/market/tickers`:
 
-1. Fetch all USDT Perpetual symbols.
-2. Sort by 24h Turnover (Volume).
-3. **Exclude** the Top 15 assets by volume (e.g., BTC, ETH, SOL, BNB, XRP, DOGE...).
-4. **Select** the next 100 assets (Rank 16 to 116).
-5. *Constraint:* Volume must still be > $10M/24h (to avoid dead coins).
+* `highPrice24h` (High Price 24h)
+* `lowPrice24h` (Low Price 24h)
+* `price24hPcnt` (24h Price Change %)
 
-### 1.2 Fetch Funding Rates
-
-**File:** `internal/bybit/api.go`
-**Action:** Implement a method `GetFundingRates(symbols []string) map[string]float64`.
-**Details:**
-
-* Use Bybit V5 endpoint: `GET /v5/market/tickers`.
-* Field: `fundingRate`.
-* Update this data periodically (e.g., every 5 minutes) via a background ticker in `main.go`.
+**Constraint:** Ensure these fields are passed to the `Strategy Engine` during the periodic update loop.
 
 ---
 
 ## 2. Module: Strategy Engine (`internal/strategy`)
 
-### 2.1 Filter: Funding Rate (Anti-Squeeze)
+### 2.1 Filter: Volatility Gatekeeper
 
 **File:** `internal/strategy/engine.go`
-**Action:** Add a "Crowded Short" check before generating a signal.
+**Location:** Inside the main analysis loop, *before* running expensive calculations (like RS or Support detection).
 **Logic:**
+Exclude assets that have very low daily volatility (dead coins or stable-like behavior).
 
 ```go
-// If funding is highly negative, shorts are paying longs.
-// This indicates a crowded trade and high squeeze risk.
-if fundingRate < -0.015 { // Threshold: -0.015%
-    return nil // REJECT SIGNAL
+// Calculate Normalized Daily Range (NDR)
+// Formula: (High24h - Low24h) / CurrentPrice
+dailyRange := ticker.HighPrice24h - ticker.LowPrice24h
+volatility := dailyRange / currentPrice
+
+// Threshold: 3% (0.03)
+if volatility < 0.03 {
+    return nil // REJECT: Asset is too stable/dead, not worth trading fees.
 }
 
 ```
 
-### 2.2 Confirmation: Wick Analysis (No Buyback)
+### 2.2 Scoring: "Pump Rollover" Bonus
 
-**File:** `internal/strategy/engine.go`
-**Action:** Refine the Breakdown Trigger logic. We must ensure the candle closed near the bottom, not just below support.
-**Formula:**
+**File:** `internal/strategy/engine.go` (inside `CalculateScore` function)
+**Logic:**
+Give a score bonus to assets that are **Green** on the daily timeframe (> +5%) but are currently generating a Breakdown signal. This targets the "long squeeze" scenario where day-traders are trapped.
 
 ```go
-candleRange := candle.High - candle.Low
-closePosition := (candle.Close - candle.Low) / candleRange
-
-// If closePosition > 0.3, it means the price bounced back up from the low (long lower wick).
-// We want the price to close in the bottom 30% of the candle.
-if closePosition > 0.3 {
-    return nil // REJECT SIGNAL (Too much buy pressure)
+// BONUS: Pump Rollover (The "Hangover" Effect)
+// If the coin is up > 5% in the last 24h, but we have a breakdown signal locally,
+// it indicates a potential reversal of a pump. This is a high-quality setup.
+if ticker.Price24hPcnt > 0.05 { // > +5%
+    score += 15
 }
 
 ```
-
-### 2.3 Scoring Update
-
-**Action:** Update `CalculateScore` logic.
-
-* **Add (+20 pts):** If `FundingRate > 0.01%` (Positive funding = Longs paying shorts = Healthy for breakdown).
-* **Add (+10 pts):** If `ClosePosition < 0.1` (Closed at the very dead bottom).
 
 ---
 
-## 3. Summary of Changes
+## 3. Implementation Summary (Checklist)
 
-1. **Assets:** Top 100 → Mid-Cap Volatile (Exclude Top 15).
-2. **Safety:** Reject if `Funding < -0.015%`.
-3. **Pattern:** Reject if Candle Wick > 30% of body (Buyback detected).
+1. **Update Models:** Ensure `Ticker` struct has 24h stats.
+2. **Update Engine:**
+* Add **Volatility Filter** (`NDR < 3%` -> Skip).
+* Add **Pump Bonus** to Scoring (`24h Change > 5%` -> +15 pts).
+
+
+3. **No Architecture Changes:** Continue using the existing RingBuffer and sliding window mechanism.
+
+---
+
+**Note on "30 Candle Window":**
+Confirm in comments that the analysis runs on a **sliding window**. Even though we look back 30-60 minutes, the analysis is triggered on *every* new 1-minute candle close, ensuring real-time signal detection without delays.

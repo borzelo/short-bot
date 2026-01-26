@@ -25,6 +25,9 @@ type tickerInfo struct {
 	Turnover24h  string `json:"turnover24h"`
 	LastPrice    string `json:"lastPrice"`
 	FundingRate  string `json:"fundingRate"`
+	HighPrice24h string `json:"highPrice24h"`
+	LowPrice24h  string `json:"lowPrice24h"`
+	Price24hPcnt string `json:"price24hPcnt"`
 }
 
 type tickerResponse struct {
@@ -247,22 +250,31 @@ func (c *APIClient) fetchTickersBody(baseURL string) ([]byte, int, error) {
 	return body, resp.StatusCode, nil
 }
 
-func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error) {
+// TickerData combines funding rates and 24h stats (fetched in single API call)
+type TickerData struct {
+	FundingRates   map[string]float64
+	Ticker24hStats map[string]*models.Ticker24hStats
+}
+
+// GetTickerData fetches both funding rates and 24h stats in a SINGLE API call (v1.3.0 optimization)
+// This avoids duplicate HTTP requests to ByBit API
+func (c *APIClient) GetTickerData(symbols []string) (*TickerData, error) {
 	tickers, err := c.fetchTickersFromAPI()
 	if err != nil {
-		// Return empty map with zero funding rates as fallback
-		// This allows the strategy to work without funding data
-		// (funding filter will pass since 0 >= -0.015)
 		log.Warn().
 			Err(err).
 			Int("symbols_count", len(symbols)).
-			Msg("funding rates unavailable, using zero fallback - signals will work but without funding scoring")
+			Msg("ticker data unavailable, using fallback values")
 		
+		// Return fallback with zero funding rates (allows strategy to work)
 		rates := make(map[string]float64, len(symbols))
 		for _, symbol := range symbols {
 			rates[symbol] = 0 // Neutral funding assumption
 		}
-		return rates, nil
+		return &TickerData{
+			FundingRates:   rates,
+			Ticker24hStats: make(map[string]*models.Ticker24hStats),
+		}, nil
 	}
 
 	symbolSet := make(map[string]struct{}, len(symbols))
@@ -271,23 +283,72 @@ func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error
 	}
 
 	rates := make(map[string]float64, len(symbolSet))
+	stats := make(map[string]*models.Ticker24hStats, len(symbolSet))
+
 	for _, ticker := range tickers {
 		if _, ok := symbolSet[ticker.Symbol]; !ok {
 			continue
 		}
-		if ticker.FundingRate == "" {
-			continue
+
+		// Parse funding rate
+		if ticker.FundingRate != "" {
+			if rate, err := strconv.ParseFloat(ticker.FundingRate, 64); err == nil {
+				// Convert to percent for strategy thresholds (e.g., 0.0001 => 0.01%)
+				rates[ticker.Symbol] = rate * 100
+			}
 		}
-		rate, err := strconv.ParseFloat(ticker.FundingRate, 64)
-		if err != nil {
-			continue
+
+		// Parse 24h stats
+		highPrice, _ := strconv.ParseFloat(ticker.HighPrice24h, 64)
+		lowPrice, _ := strconv.ParseFloat(ticker.LowPrice24h, 64)
+		price24hPcnt, _ := strconv.ParseFloat(ticker.Price24hPcnt, 64)
+		lastPrice, _ := strconv.ParseFloat(ticker.LastPrice, 64)
+
+		// Only add if essential data is present
+		if highPrice > 0 && lowPrice > 0 && lastPrice > 0 {
+			stats[ticker.Symbol] = &models.Ticker24hStats{
+				Symbol:       ticker.Symbol,
+				HighPrice24h: highPrice,
+				LowPrice24h:  lowPrice,
+				Price24hPcnt: price24hPcnt,
+				LastPrice:    lastPrice,
+			}
 		}
-		// Convert to percent for strategy thresholds (e.g., 0.01% => 0.01)
-		rates[ticker.Symbol] = rate * 100
 	}
 
-	log.Info().Int("rates_count", len(rates)).Msg("funding rates fetched successfully")
-	return rates, nil
+	log.Info().
+		Int("funding_count", len(rates)).
+		Int("stats_count", len(stats)).
+		Msg("ticker data fetched successfully (single API call)")
+
+	return &TickerData{
+		FundingRates:   rates,
+		Ticker24hStats: stats,
+	}, nil
+}
+
+// GetTicker24hStats fetches 24h price statistics (uses combined GetTickerData internally)
+// Kept for backward compatibility
+func (c *APIClient) GetTicker24hStats(symbols []string) (map[string]*models.Ticker24hStats, error) {
+	data, err := c.GetTickerData(symbols)
+	if err != nil {
+		return make(map[string]*models.Ticker24hStats), err
+	}
+	return data.Ticker24hStats, nil
+}
+
+// GetFundingRates fetches funding rates (uses combined GetTickerData internally)
+// Kept for backward compatibility
+func (c *APIClient) GetFundingRates(symbols []string) (map[string]float64, error) {
+	data, err := c.GetTickerData(symbols)
+	if err != nil {
+		rates := make(map[string]float64, len(symbols))
+		for _, symbol := range symbols {
+			rates[symbol] = 0
+		}
+		return rates, err
+	}
+	return data.FundingRates, nil
 }
 
 // getDefaultSymbols returns a hardcoded list of popular USDT perpetuals
