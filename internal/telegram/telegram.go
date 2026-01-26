@@ -34,6 +34,14 @@ func NewNotifier(botToken, chatID string) *Notifier {
 }
 
 func (n *Notifier) SendSignal(signal *models.Signal) error {
+	// Log start of sending
+	log.Info().
+		Str("symbol", signal.Symbol).
+		Int("score", signal.ScoreTotal).
+		Float64("price", signal.PriceTrigger).
+		Float64("level_broken", signal.LevelBroken).
+		Msg("preparing to send telegram notification")
+
 	message := n.formatMessage(signal)
 
 	payload := sendMessageRequest{
@@ -44,25 +52,42 @@ func (n *Notifier) SendSignal(signal *models.Signal) error {
 
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
+		log.Error().Err(err).Str("symbol", signal.Symbol).Msg("failed to marshal telegram payload")
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", n.botToken)
 
+	log.Debug().
+		Str("symbol", signal.Symbol).
+		Str("chat_id", n.chatID).
+		Int("payload_size", len(jsonData)).
+		Msg("sending telegram request")
+
 	resp, err := n.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
+		log.Error().Err(err).Str("symbol", signal.Symbol).Msg("failed to send telegram request")
 		return fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram api error: status %d", resp.StatusCode)
+		// Read response body for debugging
+		var respBody bytes.Buffer
+		respBody.ReadFrom(resp.Body)
+		log.Error().
+			Int("status_code", resp.StatusCode).
+			Str("response", respBody.String()).
+			Str("symbol", signal.Symbol).
+			Msg("telegram API returned error")
+		return fmt.Errorf("telegram api error: status %d, response: %s", resp.StatusCode, respBody.String())
 	}
 
 	log.Info().
 		Str("symbol", signal.Symbol).
 		Int("score", signal.ScoreTotal).
-		Msg("telegram notification sent")
+		Float64("price", signal.PriceTrigger).
+		Msg("telegram notification sent successfully")
 
 	return nil
 }

@@ -163,11 +163,13 @@ func (c *APIClient) fetchSymbolsFromAPI() ([]string, error) {
 	return selected, nil
 }
 
-// Alternative ByBit API endpoints that may bypass Cloudflare
+// Alternative ByBit API endpoints (for geo-redundancy)
+// NOTE: All Bybit endpoints block US/UK IPs. Use Railway region eu-west or asia-southeast.
 var alternativeAPIs = []string{
-	"https://api.bytick.com",      // Alternative ByBit domain
-	"https://api.bybit.nl",        // Netherlands region
-	"https://api-demo.bybit.com",  // Demo API (real market data)
+	"https://api.bytick.com",       // Alternative ByBit domain
+	"https://api.bybit.nl",         // Netherlands region
+	"https://api-demo.bybit.com",   // Demo API (real market data)
+	"https://api.bybit.com",        // Main API
 }
 
 func (c *APIClient) fetchTickersFromAPI() ([]tickerInfo, error) {
@@ -221,10 +223,17 @@ func (c *APIClient) fetchTickersFromAPI() ([]tickerInfo, error) {
 		}
 	}
 
-	log.Warn().
-		Int("status_code", lastStatusCode).
-		Int("urls_tried", len(urlsToTry)).
-		Msg("all API endpoints returned non-200 status, will use fallback")
+	if lastStatusCode == 403 {
+		log.Error().
+			Int("status_code", lastStatusCode).
+			Int("urls_tried", len(urlsToTry)).
+			Msg("GEO-BLOCKED: Bybit blocks US/UK IPs. Change Railway region to eu-west or asia-southeast")
+	} else {
+		log.Warn().
+			Int("status_code", lastStatusCode).
+			Int("urls_tried", len(urlsToTry)).
+			Msg("all API endpoints returned non-200 status, will use fallback")
+	}
 	return nil, lastErr
 }
 
