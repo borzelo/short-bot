@@ -539,10 +539,12 @@ func (e *Engine) GetMarketData(symbol string) (*models.MarketData, error) {
 
 	currentCandle := buffer.Last()
 	avgVolume := e.calculateAvgVolume(buffer)
-	support := e.detectSupport(buffer)
 
 	// Convert ring buffer to slice for MarketData
 	candles := buffer.LastN(buffer.Len())
+
+	// Use new support detection (v1.4.0)
+	support := DetectSupport(candles)
 
 	return &models.MarketData{
 		Symbol:        symbol,

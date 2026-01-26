@@ -88,14 +88,14 @@ func TestDetectSupport(t *testing.T) {
 		})
 	}
 
-	support := engine.detectSupport(candles)
+	support := DetectSupport(candles)
 
 	if support == nil {
-		t.Fatal("detectSupport() returned nil, want support level")
+		t.Fatal("DetectSupport() returned nil, want support level")
 	}
 
 	if support.Price < 99.0 || support.Price > 101.0 {
-		t.Errorf("detectSupport() price = %v, want around 100.0", support.Price)
+		t.Errorf("DetectSupport() price = %v, want around 100.0", support.Price)
 	}
 }
 
