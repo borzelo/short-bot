@@ -65,7 +65,18 @@ func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
 
 	// Get tickers with 24h volume
 	tickerURL := fmt.Sprintf("%s/v5/market/tickers?category=linear", c.baseURL)
-	resp, err := c.client.Get(tickerURL)
+
+	// Create request with headers
+	req, err := http.NewRequest("GET", tickerURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	// Add headers to avoid Cloudflare blocking
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MillionaireBot/1.0)")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch tickers: %w", err)
 	}
@@ -76,8 +87,20 @@ func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
 
+	// Log response for debugging
+	if resp.StatusCode != http.StatusOK {
+		log.Error().
+			Int("status_code", resp.StatusCode).
+			Str("body_preview", string(body[:min(200, len(body))])).
+			Msg("unexpected status code from ByBit API")
+		return nil, fmt.Errorf("bybit api returned status %d", resp.StatusCode)
+	}
+
 	var tickerResp tickerResponse
 	if err := json.Unmarshal(body, &tickerResp); err != nil {
+		log.Error().
+			Str("body_preview", string(body[:min(500, len(body))])).
+			Msg("failed to unmarshal response")
 		return nil, fmt.Errorf("unmarshal tickers: %w", err)
 	}
 
@@ -125,7 +148,17 @@ func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
 
 	// Get instrument info for top 100
 	instrumentURL := fmt.Sprintf("%s/v5/market/instruments-info?category=linear", c.baseURL)
-	resp, err = c.client.Get(instrumentURL)
+
+	// Create request with headers
+	req, err = http.NewRequest("GET", instrumentURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create instruments request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MillionaireBot/1.0)")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err = c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch instruments: %w", err)
 	}
@@ -136,8 +169,19 @@ func (c *APIClient) GetTop100USDTFutures() ([]models.Asset, error) {
 		return nil, fmt.Errorf("read instruments: %w", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		log.Error().
+			Int("status_code", resp.StatusCode).
+			Str("body_preview", string(body[:min(200, len(body))])).
+			Msg("unexpected status code from instruments API")
+		return nil, fmt.Errorf("instruments api returned status %d", resp.StatusCode)
+	}
+
 	var instrumentResp instrumentResponse
 	if err := json.Unmarshal(body, &instrumentResp); err != nil {
+		log.Error().
+			Str("body_preview", string(body[:min(500, len(body))])).
+			Msg("failed to unmarshal instruments response")
 		return nil, fmt.Errorf("unmarshal instruments: %w", err)
 	}
 
