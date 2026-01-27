@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/islamtagirov/millionaire-bot/internal/bybit"
@@ -11,12 +12,16 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// Rate limiting constants for API calls
+// Rate limiting and worker pool constants for API calls
 const (
-	apiRequestDelay = 100 * time.Millisecond // 100ms between API calls to avoid rate limiting
+	// v1.7.0: Parallel scanning with worker pool
+	scanWorkers      = 5                      // Number of parallel workers (5 = ~50 req/sec with 100ms delay)
+	apiRequestDelay  = 100 * time.Millisecond // 100ms between API calls per worker
+	scanTimeout      = 5 * time.Minute        // Maximum time for entire scan
 )
 
 // WeaknessScanner scans all assets and ranks them by weakness (v1.4.0)
+// v1.7.0: Uses worker pool for parallel API calls
 type WeaknessScanner struct {
 	client     *bybit.APIClient
 	scorer     *WeaknessScorer
@@ -35,10 +40,19 @@ func NewWeaknessScanner(client *bybit.APIClient) *WeaknessScanner {
 	}
 }
 
-// ScanAll recalculates WeaknessScore for all symbols
-// Should be called every hour
+// scanResult holds the result of scanning a single symbol
+type scanResult struct {
+	symbol string
+	score  *models.WeaknessScore
+	err    error
+}
+
+// ScanAll recalculates WeaknessScore for all symbols using parallel workers
+// v1.7.0: Uses worker pool for ~5x faster scanning
+// Should be called every 15 minutes
 func (ws *WeaknessScanner) ScanAll(symbols []string) error {
-	log.Info().Int("symbols", len(symbols)).Msg("starting weakness scan")
+	startTime := time.Now()
+	log.Info().Int("symbols", len(symbols)).Int("workers", scanWorkers).Msg("starting parallel weakness scan")
 
 	// Fetch BTC candles first (used as benchmark)
 	btcDaily, err := ws.client.GetKlines("BTCUSDT", "D", 200)
@@ -57,44 +71,108 @@ func (ws *WeaknessScanner) ScanAll(symbols []string) error {
 	ws.btc4h = btc4h
 	ws.mu.Unlock()
 
-	// Get ticker data for funding rates
-	tickerData, _ := ws.client.GetTickerData(symbols)
-
-	// Process each symbol
-	newScores := make(map[string]*models.WeaknessScore)
-	processed := 0
-	errors := 0
-
-	for _, symbol := range symbols {
-		if symbol == "BTCUSDT" {
-			continue // Skip BTC itself
-		}
-
-		score, err := ws.calculateWeaknessScore(symbol, tickerData)
-		if err != nil {
-			log.Debug().Err(err).Str("symbol", symbol).Msg("failed to calculate weakness score")
-			errors++
-			continue
-		}
-
-		score.Symbol = symbol
-		newScores[symbol] = score
-		processed++
-
-		// Rate limiting to avoid API throttling
-		time.Sleep(apiRequestDelay)
+	// Get ticker data for funding rates (single API call)
+	tickerData, err := ws.client.GetTickerData(symbols)
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to fetch ticker data for weakness scoring")
 	}
 
+	// Filter symbols (exclude BTCUSDT)
+	filteredSymbols := make([]string, 0, len(symbols))
+	for _, symbol := range symbols {
+		if symbol != "BTCUSDT" {
+			filteredSymbols = append(filteredSymbols, symbol)
+		}
+	}
+
+	// Create channels for worker pool
+	symbolChan := make(chan string, len(filteredSymbols))
+	resultChan := make(chan scanResult, len(filteredSymbols))
+
+	// Counters for stats
+	var processed, errors int64
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < scanWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			ws.scanWorker(workerID, symbolChan, resultChan, tickerData)
+		}(i)
+	}
+
+	// Send symbols to workers
+	go func() {
+		for _, symbol := range filteredSymbols {
+			symbolChan <- symbol
+		}
+		close(symbolChan)
+	}()
+
+	// Wait for all workers to finish, then close results
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results with timeout
+	newScores := make(map[string]*models.WeaknessScore)
+	timeout := time.After(scanTimeout)
+
+collectLoop:
+	for {
+		select {
+		case result, ok := <-resultChan:
+			if !ok {
+				break collectLoop // Channel closed, all done
+			}
+			if result.err != nil {
+				atomic.AddInt64(&errors, 1)
+				log.Debug().Err(result.err).Str("symbol", result.symbol).Msg("failed to calculate weakness score")
+			} else {
+				atomic.AddInt64(&processed, 1)
+				newScores[result.symbol] = result.score
+			}
+		case <-timeout:
+			log.Warn().
+				Int64("processed", atomic.LoadInt64(&processed)).
+				Int64("errors", atomic.LoadInt64(&errors)).
+				Msg("weakness scan timed out")
+			break collectLoop
+		}
+	}
+
+	// Update scores atomically
 	ws.mu.Lock()
 	ws.scores = newScores
 	ws.mu.Unlock()
 
+	elapsed := time.Since(startTime)
 	log.Info().
-		Int("processed", processed).
-		Int("errors", errors).
-		Msg("weakness scan completed")
+		Int64("processed", atomic.LoadInt64(&processed)).
+		Int64("errors", atomic.LoadInt64(&errors)).
+		Dur("elapsed", elapsed).
+		Float64("symbols_per_sec", float64(processed)/elapsed.Seconds()).
+		Msg("parallel weakness scan completed")
 
 	return nil
+}
+
+// scanWorker processes symbols from the channel with rate limiting
+func (ws *WeaknessScanner) scanWorker(workerID int, symbols <-chan string, results chan<- scanResult, tickerData *bybit.TickerData) {
+	for symbol := range symbols {
+		score, err := ws.calculateWeaknessScore(symbol, tickerData)
+		if err != nil {
+			results <- scanResult{symbol: symbol, err: err}
+		} else {
+			score.Symbol = symbol
+			results <- scanResult{symbol: symbol, score: score}
+		}
+
+		// Rate limiting per worker to respect ByBit API limits
+		time.Sleep(apiRequestDelay)
+	}
 }
 
 func (ws *WeaknessScanner) calculateWeaknessScore(symbol string, tickerData *bybit.TickerData) (*models.WeaknessScore, error) {

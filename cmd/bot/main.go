@@ -140,6 +140,7 @@ func main() {
 	go processSignals(ctx, engine, store, notifier)
 
 	// v1.6.0: Weakness scanner update function with dynamic subscriptions
+	// v1.7.0: Added engine memory cleanup to prevent leaks
 	updateWeaknessScores := func() {
 		log.Info().Msg("updating weakness scores...")
 		if err := weaknessScanner.ScanAll(allSymbols); err != nil {
@@ -164,6 +165,19 @@ func main() {
 				Int("active", wsClient.GetSubscribedCount()).
 				Msg("cleaned up inactive subscriptions")
 		}
+
+		// v1.7.0: Cleanup engine memory for inactive symbols
+		// Build active symbols set from current WebSocket subscriptions
+		activeSymbolsList := wsClient.GetSubscribedSymbols()
+		activeSymbols := make(map[string]struct{}, len(activeSymbolsList))
+		for _, sym := range activeSymbolsList {
+			activeSymbols[sym] = struct{}{}
+		}
+		if engineCleaned := engine.CleanupInactiveSymbols(activeSymbols); engineCleaned > 0 {
+			log.Info().
+				Int("cleaned_engine_symbols", engineCleaned).
+				Msg("cleaned up inactive engine data")
+		}
 	}
 
 	// Start periodic tasks
@@ -171,9 +185,14 @@ func main() {
 
 	log.Info().Msg("✅ Bot is running and monitoring weak assets")
 
-	// Wait for shutdown signal
-	<-sigChan
-	log.Info().Msg("🛑 Shutdown signal received, stopping gracefully...")
+	// v1.7.0: Wait for shutdown signal OR fatal WebSocket error
+	// This replaces direct <-sigChan to enable graceful shutdown on WebSocket failures
+	select {
+	case sig := <-sigChan:
+		log.Info().Str("signal", sig.String()).Msg("🛑 Shutdown signal received, stopping gracefully...")
+	case err := <-wsClient.GetFatalChan():
+		log.Error().Err(err).Msg("🚨 Fatal WebSocket error, initiating graceful shutdown...")
+	}
 
 	cancel()
 	time.Sleep(2 * time.Second)

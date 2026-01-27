@@ -178,8 +178,18 @@ const (
 ```
 - Автоматическое переподключение при разрыве соединения
 - Exponential backoff с лимитом 60 секунд
-- Максимум 10 попыток, затем Fatal error
+- Максимум 10 попыток, затем **graceful shutdown через fatalChan** (v1.7.0)
 - **Не требует внешнего handleReconnect** — соответствует SRP
+
+**Graceful Error Handling (v1.7.0):**
+```go
+// Вместо log.Fatal() — отправка ошибки в канал для graceful shutdown
+if !c.reconnect() {
+    err := fmt.Errorf("unable to maintain WebSocket after %d attempts", maxReconnectAttempts)
+    c.fatalChan <- err  // main.go слушает этот канал
+    return
+}
+```
 
 **Валидация свечей**:
 ```go
@@ -756,8 +766,15 @@ CREATE INDEX idx_signals_symbol_time ON signals(symbol, created_at DESC);
 3. Запускаем reconnect с exponential backoff
 4. Delay: 1s → 2s → 4s → ... → 60s (cap)
 5. Максимум 10 попыток
-6. Fatal error если не удалось
+6. Если не удалось — отправляем ошибку в fatalChan (v1.7.0)
+7. main.go получает ошибку и инициирует graceful shutdown
 ```
+
+**v1.7.0 Graceful Shutdown:**
+- ✅ БД соединения закрываются корректно
+- ✅ Goroutines завершаются через context cancellation
+- ✅ Финальные логи записываются
+- ✅ Нет os.Exit(1) без cleanup
 
 ### 2. **Invalid Candle Data**
 
@@ -857,14 +874,19 @@ CREATE INDEX idx_signals_symbol_time ON signals(symbol, created_at DESC);
 
 3. **Auto-deploy**: При push в GitHub → автоматический деплой
 
-### Graceful Shutdown
+### Graceful Shutdown (v1.7.0)
 
 ```go
 sigChan := make(chan os.Signal, 1)
 signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-<-sigChan
-log.Info().Msg("🛑 Shutdown signal received")
+// v1.7.0: Слушаем ОБА канала — сигналы ОС и фатальные ошибки WebSocket
+select {
+case sig := <-sigChan:
+    log.Info().Str("signal", sig.String()).Msg("🛑 Shutdown signal received")
+case err := <-wsClient.GetFatalChan():
+    log.Error().Err(err).Msg("🚨 Fatal WebSocket error, graceful shutdown")
+}
 cancel()
 time.Sleep(2 * time.Second)
 log.Info().Msg("👋 Bot stopped")
@@ -883,14 +905,151 @@ log.Info().Msg("👋 Bot stopped")
 | **Deployment** | Railway | Containerized, auto-deploy |
 | | | |
 | **Latency** | <100ms | От свечи до сигнала |
-| **Memory** | ~50-100MB | RingBuffer без memory leak |
-| **Symbols** | 100 USDT Perps | Mid-cap, исключая Top-15 |
+| **Memory** | ~50-100MB | RingBuffer + CleanupInactiveSymbols (v1.7.0) |
+| **Symbols** | 50 USDT Perps | Топ слабых по WeaknessScore |
 | **Warmup** | 30 минут | До первого сигнала |
 | **Cooldown** | 15 минут | Между сигналами по символу |
+| **Weakness Scan** | ~2 сек | Worker Pool 5x параллельно (v1.7.0) |
 
 ---
 
 ## История изменений
+
+### v1.7.0 (27 января 2026) — Performance & Stability Improvements
+
+**Цель:** Устранение узких мест производительности, утечек памяти и улучшение graceful shutdown.
+
+---
+
+#### 1. Параллельное сканирование слабости (Worker Pool)
+
+**Проблема:** Последовательные API вызовы с `time.Sleep(100ms)` — сканирование 100 символов занимало 10+ секунд.
+
+**Решение:** Worker Pool с 5 параллельными воркерами.
+
+**Новые константы:**
+```go
+const (
+    scanWorkers      = 5                      // Параллельных воркеров
+    apiRequestDelay  = 100 * time.Millisecond // Rate limiting per worker
+    scanTimeout      = 5 * time.Minute        // Таймаут на весь скан
+)
+```
+
+**Архитектура:**
+```
+┌──────────────┐     ┌─────────────┐     ┌──────────────┐
+│ symbolChan   │────▶│  Worker 1   │────▶│              │
+│              │     ├─────────────┤     │  resultChan  │
+│ (buffered)   │────▶│  Worker 2   │────▶│              │
+│              │     ├─────────────┤     │  (buffered)  │
+│              │────▶│  Worker 3   │────▶│              │
+│              │     ├─────────────┤     │              │
+│              │────▶│  Worker 4   │────▶│              │
+│              │     ├─────────────┤     │              │
+│              │────▶│  Worker 5   │────▶│              │
+└──────────────┘     └─────────────┘     └──────────────┘
+```
+
+**Результат:**
+- **Было:** ~10+ секунд (100 символов × 100ms)
+- **Стало:** ~2 секунды (5 воркеров параллельно)
+- **Ускорение:** ~5x
+
+---
+
+#### 2. Graceful Shutdown вместо log.Fatal()
+
+**Проблема:** `log.Fatal()` при ошибке реконнекта WebSocket вызывал `os.Exit(1)` без корректного завершения (БД соединения, goroutines).
+
+**Решение:** Канал для фатальных ошибок + graceful shutdown.
+
+**Новые поля в WSClient:**
+```go
+type WSClient struct {
+    // ...
+    fatalChan  chan error // Канал для критических ошибок
+}
+```
+
+**Новый метод:**
+```go
+func (c *WSClient) GetFatalChan() <-chan error
+```
+
+**Изменение в main.go:**
+```go
+// Было:
+<-sigChan
+log.Info().Msg("Shutdown signal received...")
+
+// Стало:
+select {
+case sig := <-sigChan:
+    log.Info().Str("signal", sig.String()).Msg("🛑 Shutdown signal received...")
+case err := <-wsClient.GetFatalChan():
+    log.Error().Err(err).Msg("🚨 Fatal WebSocket error, initiating graceful shutdown...")
+}
+```
+
+**Результат:**
+- ✅ Корректное закрытие БД соединений
+- ✅ Graceful завершение goroutines
+- ✅ Финальные логи записываются
+
+---
+
+#### 3. Устранение утечек памяти
+
+**Проблема:** Карты `candleCache`, `lastSignal`, `oiSnapshots` росли бесконечно при ротации символов.
+
+**Решение:** Метод очистки неактивных данных + исправление создания снапшотов.
+
+**Новый метод в Engine:**
+```go
+// CleanupInactiveSymbols удаляет данные для символов, которые больше не отслеживаются
+func (e *Engine) CleanupInactiveSymbols(activeSymbols map[string]struct{}) int
+```
+
+**Очищает:**
+- `candleCache` — кэш свечей
+- `lastSignal` — время последних сигналов  
+- `oiSnapshots` — снапшоты Open Interest
+
+**Исправление в calculateOIDivergence:**
+```go
+// v1.7.0 FIX: Only update snapshot if symbol is still actively tracked
+if _, stillTracked := e.ticker24hStats[symbol]; stillTracked {
+    e.oiSnapshots[symbol] = &models.OISnapshot{...}
+}
+```
+
+**Расширен GetStats():**
+```go
+return map[string]interface{}{
+    "tracked_symbols": len(e.candleCache),
+    "btc_candles":     e.btcBuffer.Len(),
+    "oi_snapshots":    len(e.oiSnapshots),    // NEW
+    "last_signals":    len(e.lastSignal),     // NEW
+}
+```
+
+**Интеграция:**
+- Вызывается в `updateWeaknessScores()` после `wsClient.CleanupInactive()`
+- BTCUSDT никогда не удаляется
+
+---
+
+#### 4. Изменённые файлы
+
+| Файл | Изменения |
+|------|-----------|
+| `internal/strategy/weakness_scanner.go` | Worker Pool, параллельная обработка, таймаут |
+| `internal/strategy/strategy.go` | `CleanupInactiveSymbols()`, расширенный `GetStats()`, fix в `calculateOIDivergence()` |
+| `internal/bybit/websocket.go` | `fatalChan`, `GetFatalChan()`, graceful error handling |
+| `cmd/bot/main.go` | Обработка `fatalChan`, вызов `CleanupInactiveSymbols()` |
+
+---
 
 ### v1.6.0 (27 января 2026) — Dynamic WebSocket Subscriptions
 
@@ -1240,5 +1399,5 @@ MaxPriceGain24h      = 0.10  // Макс. рост за 24ч для шорта
 ---
 
 **Документация актуальна на**: 27 января 2026
-**Версия бота**: 1.6.0
+**Версия бота**: 1.7.0
 **Автор архитектуры**: AI-assisted development

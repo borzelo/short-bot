@@ -15,6 +15,7 @@ import (
 )
 
 // WSClient handles WebSocket connection to ByBit with auto-reconnect
+// v1.7.0: Added fatalChan for graceful shutdown instead of log.Fatal()
 type WSClient struct {
 	url        string
 	symbols    []string // Initial symbols (kept for backwards compatibility)
@@ -22,6 +23,7 @@ type WSClient struct {
 	mu         sync.RWMutex
 	writeMu    sync.Mutex // Separate mutex for WebSocket writes (gorilla/websocket is not thread-safe for writes)
 	candleChan chan models.Candle
+	fatalChan  chan error // v1.7.0: Channel for fatal errors (triggers graceful shutdown)
 	ctx        context.Context
 	cancel     context.CancelFunc
 	connected  atomic.Bool
@@ -82,6 +84,7 @@ func NewWSClient(url string, symbols []string) *WSClient {
 		url:               url,
 		symbols:           symbols,
 		candleChan:        make(chan models.Candle, 1000),
+		fatalChan:         make(chan error, 1), // v1.7.0: Buffered to prevent blocking
 		subscribedSymbols: subscribedSymbols,
 		lastActive:        lastActive,
 	}
@@ -291,7 +294,16 @@ func (c *WSClient) readRoutine() {
 		if !c.connected.Load() {
 			// Try to reconnect
 			if !c.reconnect() {
-				log.Fatal().Msg("unable to maintain WebSocket connection, shutting down")
+				// v1.7.0: Instead of log.Fatal, send error to fatalChan for graceful shutdown
+				err := fmt.Errorf("unable to maintain WebSocket connection after %d attempts", maxReconnectAttempts)
+				log.Error().Err(err).Msg("WebSocket reconnection failed, triggering graceful shutdown")
+				
+				// Non-blocking send to fatal channel
+				select {
+				case c.fatalChan <- err:
+				default:
+					// Channel already has an error, skip
+				}
 				return
 			}
 			continue
@@ -457,6 +469,12 @@ func (c *WSClient) closeConnection() {
 
 func (c *WSClient) GetCandleChannel() <-chan models.Candle {
 	return c.candleChan
+}
+
+// GetFatalChan returns channel that receives fatal errors requiring shutdown
+// v1.7.0: Used for graceful shutdown instead of log.Fatal()
+func (c *WSClient) GetFatalChan() <-chan error {
+	return c.fatalChan
 }
 
 // Close gracefully shuts down the WebSocket client

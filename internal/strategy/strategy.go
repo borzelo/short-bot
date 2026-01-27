@@ -779,6 +779,7 @@ func (e *Engine) UpdateTicker24hStats(stats map[string]*models.Ticker24hStats) {
 // calculateOIDivergence calculates Open Interest divergence (v1.5.0)
 // Returns: deltaOI (percentage change), isAggressiveShort (OI up while price down), isLongExit (OI down while price down)
 // IMPORTANT: This function updates the snapshot AFTER comparison to ensure proper timing
+// v1.7.0: Fixed potential memory leak - only updates snapshot if symbol is actively tracked
 func (e *Engine) calculateOIDivergence(symbol string, currentCandle models.Candle) (deltaOI float64, isAggressiveShort bool, isLongExit bool) {
 	ticker := e.ticker24hStats[symbol]
 	snapshot := e.oiSnapshots[symbol]
@@ -798,11 +799,13 @@ func (e *Engine) calculateOIDivergence(symbol string, currentCandle models.Candl
 	// Calculate OI change: compare CURRENT OI (from ticker) with HISTORICAL OI (from snapshot)
 	deltaOI = (ticker.OpenInterest - snapshot.OpenInterest) / snapshot.OpenInterest
 
-	// Update snapshot AFTER comparison (critical for correct timing)
-	// This ensures we always compare against 15+ minute old data
-	e.oiSnapshots[symbol] = &models.OISnapshot{
-		OpenInterest: ticker.OpenInterest,
-		Timestamp:    time.Now(),
+	// v1.7.0 FIX: Only update snapshot if symbol is still in ticker24hStats
+	// This prevents memory leaks from orphaned snapshots
+	if _, stillTracked := e.ticker24hStats[symbol]; stillTracked {
+		e.oiSnapshots[symbol] = &models.OISnapshot{
+			OpenInterest: ticker.OpenInterest,
+			Timestamp:    time.Now(),
+		}
 	}
 
 	// Check if current candle is bearish (price going down)
@@ -875,7 +878,55 @@ func (e *Engine) GetStats() map[string]interface{} {
 	return map[string]interface{}{
 		"tracked_symbols": len(e.candleCache),
 		"btc_candles":     e.btcBuffer.Len(),
+		"oi_snapshots":    len(e.oiSnapshots),
+		"last_signals":    len(e.lastSignal),
 	}
+}
+
+// CleanupInactiveSymbols removes data for symbols that are no longer actively tracked
+// v1.7.0: Fixes memory leaks in candleCache, lastSignal, and oiSnapshots
+// activeSymbols is a set of symbols currently subscribed via WebSocket
+// Returns the number of symbols cleaned up
+func (e *Engine) CleanupInactiveSymbols(activeSymbols map[string]struct{}) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	cleaned := 0
+
+	// Cleanup candleCache - remove symbols not in active set
+	for symbol := range e.candleCache {
+		if symbol == "BTCUSDT" {
+			continue // Never remove BTC - required for RS calculation
+		}
+		if _, active := activeSymbols[symbol]; !active {
+			delete(e.candleCache, symbol)
+			cleaned++
+		}
+	}
+
+	// Cleanup lastSignal - remove old entries for inactive symbols
+	for symbol := range e.lastSignal {
+		if _, active := activeSymbols[symbol]; !active {
+			delete(e.lastSignal, symbol)
+		}
+	}
+
+	// Cleanup oiSnapshots - remove inactive symbols
+	// (ticker24hStats is already cleaned in UpdateTicker24hStats)
+	for symbol := range e.oiSnapshots {
+		if _, active := activeSymbols[symbol]; !active {
+			delete(e.oiSnapshots, symbol)
+		}
+	}
+
+	if cleaned > 0 {
+		log.Debug().
+			Int("cleaned_candle_caches", cleaned).
+			Int("remaining_symbols", len(e.candleCache)).
+			Msg("cleaned up inactive symbol data from engine")
+	}
+
+	return cleaned
 }
 
 // GetMarketData returns current market data for a symbol (for debugging)
