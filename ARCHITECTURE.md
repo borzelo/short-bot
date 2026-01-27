@@ -632,16 +632,18 @@ if ticker24h.Price24hPcnt > 0.05 {  // > +5%
 |--------|---------|-------|
 | **Слабость** | RS < -3% | +30 |
 | | RS < -5% | +10 (бонус) |
-| **Объём** | Volume >= 1.5x | +10 |
-| | Volume >= 2x | +10 |
-| | Volume >= 3x | +10 (бонус) |
+| **Объём (Z-Score)** | Z-Score > 2.0 | +10 (v1.7.1) |
+| | Z-Score > 2.5 | +10 |
+| | Z-Score > 3.0 | +10 (бонус) |
 | **Возраст уровня** | Age > 20 min | +20 |
 | **Дивергенция** | BTC↑ Asset↓ | +10 |
 | **Funding** | Funding > 0.01% | +20 |
 | **Close Position** | Close < 10% свечи | +10 |
-| **Pump Rollover** | 24h Change > +5% | +15 (v1.3.0) |
+| **Pump Rollover** | *см. Smart/Legacy ниже* | +10/+20 |
 | | | |
 | **Максимум** | | **100 (cap)** |
+
+> **Примечание (v1.7.1)**: Volume Ratio заменён на Volume Z-Score — статистически более точный метод, учитывающий дисперсию объёма.
 
 ---
 
@@ -914,6 +916,200 @@ log.Info().Msg("👋 Bot stopped")
 ---
 
 ## История изменений
+
+### v1.8.0 (27 января 2026) — Anti-Bear-Trap Filters
+
+**Цель:** Предотвращение входа в шорт на уже истощённых трендах ("bear trap" сценарии).
+
+---
+
+#### Изменения
+
+**1. Oversold Filter (24h Fatigue)**
+
+**Проблема:** Бот сигнализировал шорт на активах, которые уже упали на >15% за 24ч — высокий риск отскока.
+
+**Решение:** Ранний фильтр на основе `Price24hPcnt`.
+
+```go
+// v1.8.0: Oversold Filter
+if ticker24h.Price24hPcnt < -0.15 {  // -15%
+    return nil  // BLOCK: asset already crashed, bear trap risk
+}
+```
+
+**Логика:** Если актив упал более чем на 15% за сутки, он уже "oversold" — вероятность mean reversion выше, чем продолжение падения.
+
+---
+
+**2. Dynamic Support Age (Volatility Adjustment)**
+
+**Проблема:** В периоды высокой волатильности молодые уровни поддержки (15 мин) — просто временные паузы, не настоящие уровни.
+
+**Решение:** Динамический `minSupportAge` на основе `Change1h`.
+
+```go
+// v1.8.0: Dynamic Support Age
+change1h := calculateChange1h(buffer)
+
+minAge := 15.0  // Default
+if change1h < -0.02 {  // Dropped > 2% in 1h = high volatility
+    minAge = 45.0  // Require stronger/older support
+}
+
+if supportAge < minAge {
+    return nil
+}
+```
+
+| Условие | Min Support Age |
+|---------|-----------------|
+| Change1h >= -2% (нормально) | 15 минут |
+| Change1h < -2% (высокая волатильность) | 45 минут |
+
+---
+
+**3. MA Extension Filter (Rubber Band Effect)**
+
+**Проблема:** Шорт активов, слишком далеко ушедших от среднего — высокий риск mean reversion (эффект "резиновой ленты").
+
+**Решение:** Фильтр на основе отклонения от SMA200.
+
+```go
+// v1.8.0: MA Extension Filter
+sma200 := calculateSMA200(buffer)
+deviation := (sma200 - currentPrice) / sma200
+
+if deviation > 0.04 {  // Price > 4% below SMA200
+    return nil  // BLOCK: extended, rubber band risk
+}
+```
+
+**Логика:** Если цена более чем на 4% ниже SMA200, актив "перепродан" относительно среднего — вероятен отскок к среднему.
+
+---
+
+#### Новые константы
+
+```go
+const (
+    // v1.8.0: Anti-Bear-Trap Filters
+    OversoldThreshold24h       = -0.15 // -15% in 24h = oversold
+    HighVolatilityThreshold1h  = -0.02 // -2% in 1h = high volatility
+    HighVolatilitySupportAge   = 45.0  // 45 min support age during volatility
+    DefaultSupportAge          = 15.0  // 15 min default
+    SMAWindow                  = 200   // 200 candles for SMA
+    MAExtensionThreshold       = 0.04  // 4% below SMA = extended
+)
+```
+
+---
+
+#### Новые методы в Engine
+
+| Метод | Описание |
+|-------|----------|
+| `calculateSMA200(buffer)` | SMA из последних 200 свечей (allocation-free) |
+| `calculateChange1h(buffer)` | Изменение цены за последний час |
+
+---
+
+#### Новые хелперы в utils/math.go
+
+| Функция | Описание |
+|---------|----------|
+| `SMA(values)` | Simple Moving Average |
+| `SMAFromPrices(prices, window)` | SMA с указанием окна |
+| `CalculateDeviation(price, sma)` | % отклонения цены от SMA |
+
+---
+
+#### Изменённые файлы
+
+| Файл | Изменения |
+|------|-----------|
+| `internal/strategy/strategy.go` | 3 новых фильтра, 2 новых метода, 6 новых констант |
+| `internal/utils/math.go` | 3 новых хелпер-функции |
+| `cmd/bot/main.go` | Версия обновлена до v1.8.0 |
+| `ARCHITECTURE.md` | Документация новых фильтров |
+
+---
+
+#### Порядок фильтров в Pipeline (fail fast)
+
+```
+1. Volatility Filter (v1.3.0) — NDR < 3% → BLOCK
+2. Oversold Filter (v1.8.0) — Price24h < -15% → BLOCK  ← NEW
+3. Smart Pump Filter (v1.5.0) — Price24h > 30% → BLOCK
+4. MA Extension Filter (v1.8.0) — >4% below SMA200 → BLOCK  ← NEW
+5. OI Divergence (v1.5.0) — Long Exit detected → BLOCK
+6. RS Calculation — RS >= -3% → skip
+7. Funding Check — Funding < -0.015% → skip
+8. Volume Check — Volume < 1.5x → skip
+9. Wick Check — Close > 30% of candle → skip
+10. Support Detection — Dynamic Age (v1.8.0)  ← MODIFIED
+11. Breakdown Confirmation
+12. Score Calculation
+```
+
+---
+
+### v1.7.1 (27 января 2026) — Volume Scoring Refactor
+
+**Цель:** Устранение дублирования метрик объёма в системе скоринга.
+
+---
+
+#### Изменения
+
+**1. Удалён Volume Ratio scoring**
+
+Volume Ratio и Volume Z-Score измеряли одну и ту же метрику (аномальный объём) разными способами, что приводило к избыточному весу объёма в итоговом скоре (до 40 баллов).
+
+**Было:**
+```go
+// Volume Ratio: до 30 баллов
+if volumeRatio >= 1.5x → +10
+if volumeRatio >= 2.0x → +10
+if volumeRatio >= 3.0x → +10
+
+// Volume Z-Score: +10 баллов
+if volumeZScore > 3.0 → +10
+
+// Итого: до 40 баллов за объём
+```
+
+**Стало:**
+```go
+// Volume Z-Score only: до 30 баллов
+if volumeZScore > 2.0 → +10  // Moderate anomaly
+if volumeZScore > 2.5 → +10  // Strong anomaly
+if volumeZScore > 3.0 → +10  // Extreme anomaly
+```
+
+**2. Почему Z-Score лучше Ratio**
+
+| Метрика | Формула | Недостаток |
+|---------|---------|------------|
+| **Ratio** | Current / Mean | Не учитывает дисперсию |
+| **Z-Score** | (Current - Mean) / StdDev | ✅ Учитывает волатильность объёма |
+
+Z-Score показывает, на сколько стандартных отклонений текущий объём отличается от среднего. Это статистически корректнее: если объём актива обычно сильно "гуляет" (высокий StdDev), то даже 2x не будет аномалией.
+
+**3. Уточнена документация Pump Rollover**
+
+Добавлено примечание, что Smart Pump Rollover (+20) и Legacy Pump Rollover (+10) — взаимоисключающие бонусы (else-if логика в коде).
+
+---
+
+#### Изменённые файлы
+
+| Файл | Изменения |
+|------|-----------|
+| `internal/strategy/strategy.go` | Удалён Volume Ratio scoring, расширена шкала Z-Score (2.0/2.5/3.0) |
+| `ARCHITECTURE.md` | Обновлены таблицы скоринга, добавлены примечания |
+
+---
 
 ### v1.7.0 (27 января 2026) — Performance & Stability Improvements
 
@@ -1206,22 +1402,25 @@ DistFromHigh = (High24h - CurrentPrice) / High24h
 |--------|---------|-------|
 | **Слабость** | RS < -3% | +30 |
 | | RS < -5% | +10 (бонус) |
-| **Объём (ratio)** | Volume >= 1.5x | +10 |
-| | Volume >= 2x | +10 |
-| | Volume >= 3x | +10 (бонус) |
-| **Объём (Z-Score)** | Z-Score > 3.0 | +10 (v1.5.0) |
+| **Объём (Z-Score)** | Z-Score > 2.0 | +10 (v1.7.1) |
+| | Z-Score > 2.5 | +10 |
+| | Z-Score > 3.0 | +10 (бонус) |
 | **Возраст уровня** | Age > 20 min | +20 |
 | **Дивергенция с BTC** | BTC↑ Asset↓ | +10 |
 | **Funding** | Funding > 0.01% | +20 |
 | **Close Position** | Close < 10% свечи | +10 |
 | **OI Divergence** | Price↓ + OI↑ (>2%) | +15 (v1.5.0) |
-| **Smart Pump Rollover** | Pump>15%, Dist>5%, Z>3 | +20 (v1.5.0) |
-| **Legacy Pump Rollover** | Pump>5%, Red candle | +10 (reduced) |
+| **Pump Rollover** ¹ | Smart: Pump>15%, Dist>5%, Z>3 | +20 |
+| | Legacy: Pump>5%, Red candle | +10 |
 | **Support Touches** | >= 3 касания | +15 |
 | | >= 2 касания | +10 |
 | **Consolidation Break** | IsConsolidation=true | +10 |
 | | | |
 | **Максимум** | | **100 (cap)** |
+
+> ¹ **Pump Rollover (v1.5.0)**: Smart и Legacy бонусы **взаимоисключающие** (else-if). Если сигнал квалифицируется как Smart Pump Rollover (+20), legacy логика пропускается. Максимум один из двух бонусов.
+
+> **v1.7.1**: Volume Ratio удалён — теперь используется только Volume Z-Score для избежания дублирования метрик.
 
 **5. Новые поля в Signal.Meta**
 
@@ -1399,5 +1598,5 @@ MaxPriceGain24h      = 0.10  // Макс. рост за 24ч для шорта
 ---
 
 **Документация актуальна на**: 27 января 2026
-**Версия бота**: 1.7.0
+**Версия бота**: 1.8.0
 **Автор архитектуры**: AI-assisted development

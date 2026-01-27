@@ -29,7 +29,7 @@ const (
 func main() {
 	setupLogger()
 
-	log.Info().Msg("🚀 Starting Millionaire Bot v1.6.0")
+	log.Info().Msg("🚀 Starting Millionaire Bot v1.8.0")
 
 	cfg, err := config.Load()
 	if err != nil {

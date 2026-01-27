@@ -40,8 +40,8 @@ const (
 	PumpRolloverThreshold = 0.05  // 24h price change > 5% for pump bonus
 	PumpRolloverBonus     = 15    // Bonus points for pump rollover scenario
 
-	// v1.4.1: Anti-false-signal filters
-	MinSupportAgeMinutes = 15.0 // Minimum support level age (15 minutes)
+	// v1.4.1: Anti-false-signal filters (DEPRECATED in v1.8.0 - see DefaultSupportAge)
+	// MinSupportAgeMinutes removed - replaced by DefaultSupportAge in v1.8.0
 
 	// v1.5.0: Smart filters (replaces MaxPriceGain24h)
 	MaxPriceGain24h = 0.30 // Increased from 0.10 to 0.30 (30%) - allow more pump scenarios
@@ -52,16 +52,24 @@ const (
 	OIAggressiveShortBonus = 15  // Bonus: price down + OI up (new shorts entering)
 	OILongExitPenalty     = -50  // Penalty: price down + OI down (longs exiting, not shorts)
 
-	// v1.5.0: Volume Z-Score
-	VolumeZScoreWindow    = 24   // 24 candles for Z-Score calculation (was 20 for avg)
-	VolumeZScoreThreshold = 3.0  // Z-Score threshold for anomaly bonus
-	VolumeZScoreBonus     = 10   // Bonus for volume Z-Score > 3.0
+	// v1.5.0: Volume Z-Score (v1.7.1: now primary volume scoring method)
+	VolumeZScoreWindow    = 24  // 24 candles for Z-Score calculation
+	VolumeZScoreThreshold = 3.0 // Z-Score threshold for extreme anomaly (+30 total)
 
 	// v1.5.0: Smart Pump Filter
 	SmartPumpThreshold    = 0.15 // 15% price gain triggers smart filter
 	SmartPumpNearHighDist = 0.03 // 3% from high = still near high (BLOCK)
 	SmartPumpRolloverDist = 0.05 // 5% from high = confirmed rollover (STRONG SIGNAL)
 	SmartPumpRolloverBonus = 20  // Bonus for confirmed pump rollover with volume
+
+	// v1.8.0: Anti-Bear-Trap Filters
+	OversoldThreshold24h       = -0.15 // -15% in 24h = asset already crashed, skip short
+	HighVolatilityThreshold1h  = -0.02 // -2% in 1h = high volatility, need stronger support
+	HighVolatilitySupportAge   = 45.0  // 45 minutes min support age during high volatility
+	DefaultSupportAge          = 15.0  // 15 minutes min support age (normal conditions)
+	SMAWindow                  = 200   // 200 candles for SMA calculation
+	SMAMinCandles              = 60    // Minimum candles required for meaningful SMA (skip filter if less)
+	MAExtensionThreshold       = 0.04  // 4% below SMA200 = extended, skip short (rubber band)
 )
 
 // Engine processes candles and generates signals
@@ -245,10 +253,17 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	currentCandle := buffer.Last()
 
+	// Pre-calculate distFromHigh once (used in multiple places)
+	// v1.8.0: Optimization - avoid redundant calculation
+	var distFromHigh float64
+	ticker24h := e.ticker24hStats[symbol]
+	if ticker24h != nil && ticker24h.HighPrice24h > 0 {
+		distFromHigh = utils.DistanceFromHigh(currentCandle.Close, ticker24h.HighPrice24h)
+	}
+
 	// 0. Volatility Filter (v1.3.0) - reject dead/stable coins early
 	// Formula: NDR = (High24h - Low24h) / LastPrice
 	// Threshold: 3% minimum volatility
-	ticker24h := e.ticker24hStats[symbol]
 	if ticker24h != nil && ticker24h.LastPrice > 0 {
 		dailyRange := ticker24h.HighPrice24h - ticker24h.LowPrice24h
 		volatility := dailyRange / ticker24h.LastPrice
@@ -259,6 +274,17 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 				Float64("threshold", MinVolatility24h).
 				Msg("signal rejected: volatility too low (dead coin)")
 			return nil // REJECT: Asset is too stable/dead, not worth trading fees
+		}
+
+		// v1.8.0: Oversold Filter (24h Fatigue) - prevent shorting crashed assets
+		// If asset already dropped >15% in 24h, it's likely oversold - bear trap risk
+		if ticker24h.Price24hPcnt < OversoldThreshold24h {
+			log.Debug().
+				Str("symbol", symbol).
+				Float64("price_change_24h_pct", ticker24h.Price24hPcnt*100).
+				Float64("threshold_pct", OversoldThreshold24h*100).
+				Msg("signal rejected: asset oversold (already crashed >15% in 24h)")
+			return nil
 		}
 
 		// v1.5.0: Smart Pump Filter (replaces simple MaxPriceGain24h filter)
@@ -274,8 +300,6 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 		// v1.5.0: Smart Pump Filter - if pump > 15%, check distance from high
 		if ticker24h.Price24hPcnt > SmartPumpThreshold && ticker24h.HighPrice24h > 0 {
-			distFromHigh := utils.DistanceFromHigh(currentCandle.Close, ticker24h.HighPrice24h)
-
 			// BLOCK: If pump > 15% AND price still near high (< 3% drop) - knife catching
 			if distFromHigh < SmartPumpNearHighDist {
 				log.Debug().
@@ -285,6 +309,23 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 					Msg("signal BLOCKED: pump > 15% but price still near high (knife catching)")
 				return nil
 			}
+		}
+	}
+
+	// v1.8.0: MA Extension Filter (Rubber Band Effect) - prevent shorting too extended assets
+	// If price is >4% below SMA200, mean reversion risk is high
+	sma200, smaAvailable := e.calculateSMA200(buffer)
+	if smaAvailable {
+		deviation := utils.CalculateDeviation(currentCandle.Close, sma200)
+		if deviation > MAExtensionThreshold {
+			log.Debug().
+				Str("symbol", symbol).
+				Float64("current_price", currentCandle.Close).
+				Float64("sma200", sma200).
+				Float64("deviation_pct", deviation*100).
+				Float64("threshold_pct", MAExtensionThreshold*100).
+				Msg("signal rejected: price extended from SMA200 (rubber band risk)")
+			return nil
 		}
 	}
 
@@ -346,13 +387,30 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
-	// 6.1 v1.4.1: Check minimum support age - reject too young levels (noise)
+	// 6.1 v1.8.0: Dynamic Support Age (replaces v1.4.1 static MinSupportAgeMinutes)
+	// During high volatility (price dropped >2% in 1h), require stronger/older support levels
 	supportAgeMinutes := time.Since(support.Timestamp).Minutes()
-	if supportAgeMinutes < MinSupportAgeMinutes {
+	minSupportAge := DefaultSupportAge // Default 15 minutes
+
+	// Calculate 1h price change from candle buffer
+	change1h := e.calculateChange1h(buffer)
+	if change1h < HighVolatilityThreshold1h {
+		// High volatility detected - asset dropped >2% in last hour
+		// Require older support levels (45 min) to avoid temporary pauses
+		minSupportAge = HighVolatilitySupportAge
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("change_1h_pct", change1h*100).
+			Float64("adjusted_min_age", minSupportAge).
+			Msg("high volatility: increased minimum support age")
+	}
+
+	if supportAgeMinutes < minSupportAge {
 		log.Debug().
 			Str("symbol", symbol).
 			Float64("support_age_min", supportAgeMinutes).
-			Float64("min_required", MinSupportAgeMinutes).
+			Float64("min_required", minSupportAge).
+			Float64("change_1h_pct", change1h*100).
 			Msg("signal rejected: support level too young")
 		return nil
 	}
@@ -375,10 +433,9 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	volumeZScore, meanVol, stdDevVol := e.calculateVolumeZScore(buffer, currentCandle.Volume)
 
 	// 10. Check for Smart Pump Rollover bonus eligibility (v1.5.0)
+	// distFromHigh already calculated at the top of analyzeBreakdown (v1.8.0 optimization)
 	isSmartPumpRollover := false
-	distFromHigh := 0.0
 	if ticker24h != nil && ticker24h.HighPrice24h > 0 {
-		distFromHigh = utils.DistanceFromHigh(currentCandle.Close, ticker24h.HighPrice24h)
 		// Smart Pump Rollover: pump > 15%, distance from high > 5%, Z-Score > 3.0
 		if ticker24h.Price24hPcnt > SmartPumpThreshold &&
 			distFromHigh > SmartPumpRolloverDist &&
@@ -618,21 +675,17 @@ func (e *Engine) calculateScoreV150(
 		}
 	}
 
-	// Volume scoring (up to 30 points) - keep legacy ratio scoring
-	if volumeRatio >= VolumeMinRatio {
-		score += 10 // Base score for meeting volume threshold
-		if volumeRatio >= VolumeMediumRatio {
-			score += 10 // Additional for 2x+
-			if volumeRatio >= VolumeHighRatio {
-				score += 10 // Additional for 3x+
+	// v1.7.1: Volume scoring using Z-Score only (removed legacy ratio scoring to avoid duplication)
+	// Z-Score is statistically more accurate as it accounts for variance
+	// Scale: Z>2.0 = +10, Z>2.5 = +20, Z>3.0 = +30
+	if volumeZScore > 2.0 {
+		score += 10 // Moderate anomaly
+		if volumeZScore > 2.5 {
+			score += 10 // Strong anomaly
+			if volumeZScore > VolumeZScoreThreshold { // 3.0
+				score += 10 // Extreme anomaly
 			}
 		}
-	}
-
-	// v1.5.0: Volume Z-Score bonus (10 points)
-	// Statistical anomaly detection - more precise than simple ratio
-	if volumeZScore > VolumeZScoreThreshold {
-		score += VolumeZScoreBonus
 	}
 
 	// Level Age scoring (20 points)
@@ -869,6 +922,56 @@ func (e *Engine) calculateVolumeZScore(buffer *RingBuffer, currentVolume float64
 
 	zScore = (currentVolume - meanVol) / stdDevVol
 	return zScore, meanVol, stdDevVol
+}
+
+// calculateSMA200 calculates Simple Moving Average from last 200 closing prices (v1.8.0)
+// Returns SMA value and boolean indicating if calculation was possible
+// Uses allocation-free direct buffer access for performance
+// IMPORTANT: Returns available=false if we have fewer than SMAMinCandles (60) to avoid
+// unreliable SMA calculations. Short-period SMA is much more volatile than SMA200.
+func (e *Engine) calculateSMA200(buffer *RingBuffer) (sma float64, available bool) {
+	// Need minimum candles for meaningful SMA calculation
+	// With fewer candles, SMA becomes too volatile and filter gives false positives
+	if buffer.Len() < SMAMinCandles {
+		return 0, false // Not enough data for reliable SMA
+	}
+
+	window := SMAWindow
+	if buffer.Len() < window {
+		window = buffer.Len()
+	}
+
+	// Calculate SMA directly from ring buffer to avoid slice allocation
+	var sum float64
+	startIdx := buffer.Len() - window
+	for i := startIdx; i < buffer.Len(); i++ {
+		sum += buffer.Get(i).Close
+	}
+
+	return sum / float64(window), true
+}
+
+// calculateChange1h calculates price change over last 60 minutes (v1.8.0)
+// Returns change as decimal (e.g., -0.02 = -2%)
+// Used for Dynamic Support Age filter to detect high volatility
+func (e *Engine) calculateChange1h(buffer *RingBuffer) float64 {
+	// Need at least 60 candles for 1h lookback (1-min candles)
+	lookback := 60
+	if buffer.Len() < lookback {
+		lookback = buffer.Len()
+	}
+	if lookback < 2 {
+		return 0
+	}
+
+	oldPrice := buffer.Get(buffer.Len() - lookback).Close
+	newPrice := buffer.Last().Close
+
+	if oldPrice == 0 {
+		return 0
+	}
+
+	return (newPrice - oldPrice) / oldPrice
 }
 
 func (e *Engine) GetStats() map[string]interface{} {

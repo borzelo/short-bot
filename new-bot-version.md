@@ -1,85 +1,52 @@
+# Role
+You are a Senior Go Developer specializing in High-Frequency Trading (HFT) systems.
 
-# Спецификация для Claude CLI: Внедрение Smart-фильтров (v1.5.0)
+# Context
+We are upgrading a trading bot (v1.7.1) implementing the "Short Breakdown on Weak Assets" strategy.
+The current architecture uses a `RingBuffer` for candles, a `Strategy Engine` for signal detection, and PostgreSQL for storage.
+Recently, we identified a logic flaw: the bot signals shorts on assets that are already oversold (e.g., dropped >15% in 24h) or extended too far from the mean, leading to "bear trap" losses.
 
-## Контекст
+# Task
+Implement 3 specific filters to prevent late entries on exhausted trends. Modify `internal/strategy` and `internal/models` as needed.
 
-Проект: **Millionaire Bot** (Architecture v1.4.1)
-Стек: Go 1.22, Modular Monolith.
-Основные структуры: `Engine`, `RingBuffer`, `WeaknessScanner`.
-Задача: Внедрить микроструктурные фильтры для повышения WinRate.
+# Specific Requirements
 
----
+## 1. Oversold Filter (24h Fatigue)
+**Goal:** Prevent shorting assets that have already crashed significantly.
+**Implementation:**
+- In `internal/strategy/engine.go` (or where filters are applied):
+- Check `Ticker24hStats.Price24hPcnt`.
+- **Logic:** If `Price24hPcnt < -0.15` (lower than -15%), **discard the signal immediately** (return nil).
+- Add a log message: "Signal rejected: asset oversold (-XX%)".
 
-## Задачи на внедрение
+## 2. Dynamic Support Age (Volatility Adjustment)
+**Goal:** Require older, stronger support levels during high volatility to avoid shorting temporary pauses.
+**Implementation:**
+- In the `Support Detection` logic:
+- Calculate `Change1h` (Price change over the last 60 minutes based on candles in RingBuffer).
+- Define dynamic `minAge`:
+    - IF `Change1h` drop is > 2% (value < -0.02): Set `minAge = 45 minutes`.
+    - ELSE: Set `minAge = 15 minutes` (default).
+- Update the condition `if supportAge < minAge { return }`.
 
-### 1. Анализ Открытого Интереса (Open Interest Divergence)
+## 3. MA Extension Filter (Rubber Band Effect)
+**Goal:** Prevent shorting when price is too far below the average (risk of mean reversion).
+**Implementation:**
+- **Math Helper:** Ensure a function exists to calculate SMA (Simple Moving Average) from a slice of floats.
+- **In Engine:**
+    - Calculate `SMA_200` using the last 200 closing prices from the `RingBuffer`.
+    - If `RingBuffer` has fewer than 200 candles, skip this filter (or use available max).
+    - Calculate Deviation: `diff = (SMA_200 - CurrentClose) / SMA_200`.
+    - **Logic:** If `diff > 0.04` (Price is >4% below SMA_200), **discard the signal**.
+    - Add a log message: "Signal rejected: price extended from SMA200 by X%".
 
-**Цель:** Шортить только тогда, когда в рынок входят новые деньги (OI растет). Избегать шортов на закрытии лонгов (Long Squeeze).
+## Code Structure Constraints
+- Keep the code allocation-free where possible (reuse existing buffers).
+- Add these checks **early** in the pipeline (fail fast principle).
+- Ensure all "Magic Numbers" (0.15, 0.04, 45, 200) are defined as constants at the top of the package or in `config`.
 
-**Реализация:**
-
-1. **Data Layer (`internal/bybit`):**
-* В структуру `TickerData` добавить поле `OpenInterest` (float64).
-* Обновить метод получения тикеров (или `UpdateTickerData`), чтобы он запрашивал OI через V5 API.
-
-
-2. **Engine (`internal/strategy`):**
-* Добавить мапу для хранения истории OI: `map[string]*RingBuffer` (или упрощенно: хранить значение OI 15-минутной давности).
-* *Оптимизация:* Если `RingBuffer` свечей уже есть, можно не создавать отдельный буфер, а просто хранить snapshot OI каждые 15 минут.
-
-
-3. **Signal Logic:**
-* Рассчитать `DeltaOI` = `(CurrentOI - OI_15m_Ago) / OI_15m_Ago`.
-* **Правило:** Если `Price` падает, а `OI` падает (> 2%) — это выход лонгов. **ШТРАФ** (-50 баллов или Block).
-* **Бонус:** Если `Price` падает, а `OI` растет (> 2%) — это агрессивный шорт. **БОНУС** (+15 баллов).
-
-
-
-### 2. Volume Analysis (Z-Score)
-
-**Цель:** Заменить грубый `Volume Ratio` на статистически верный `Z-Score`.
-
-**Реализация:**
-
-1. **Helper (`internal/utils`):**
-* Реализовать функцию расчета StdDev (стандартного отклонения) по слайсу float64.
-
-
-2. **Strategy:**
-* Использовать данные из `RingBuffer` (последние 24 свечи) для расчета `SMA_Volume` и `StdDev_Volume`.
-* `Z-Score = (CurrentVol - SMA) / StdDev`.
-* Сохранить текущую логику `VolumeRatio` как legacy или вспомогательную, но основной вес перенести на Z-Score.
-* Если `Z-Score > 3.0` → Сильная аномалия (+10 баллов).
-
-
-
-### 3. Pump Rollover (Замена фильтра MaxPriceGain)
-
-**Важно:** В версии v1.4.1 есть жесткий фильтр `MaxPriceGain24h = 0.10` (отсекает всё, что выросло больше 10%).
-**Задача агента:** **УДАЛИТЬ** или **ОСЛАБИТЬ** этот жесткий фильтр и заменить его на "Smart Pump Filter".
-
-**Новая Логика:**
-
-1. Разрешить рассматривать активы с ростом > 10% (до 30% например).
-2. **Условие блокировки:**
-* ЕСЛИ `Price24hPcnt > 0.15` (Памп)
-* И `DistFromHigh < 0.03` (Цена всё еще на хаях, падение < 3%)
-* → **BLOCK Signal** (слишком рано, ловля ножей).
-
-
-3. **Условие входа (Rollover):**
-* ЕСЛИ `Price24hPcnt > 0.15`
-* И `DistFromHigh > 0.05` (Цена уже отвалилась от хая на 5%)
-* И `VolumeZScore > 3.0` (На высоком объеме)
-* → **STRONG SIGNAL** (Памп сдувается).
-
-
-
----
-
-## Технические требования
-
-1. Соблюдать структуру проекта (`internal/strategy`, `internal/bybit`).
-2. Не ломать существующий `WeaknessScanner`.
-3. Использовать `RingBuffer` для минимизации аллокаций памяти.
-4. В `models.Signal` добавить поле `Meta` (map[string]interface{}) для отладки новых метрик (z_score, oi_delta).
+# Output
+Provide the modified Go code blocks for:
+1. Constants definition.
+2. The logic implementation within the `analyzeBreakdown` (or equivalent) function.
+3. Helper functions for SMA and Volatility calculation if they don't exist.

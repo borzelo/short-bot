@@ -79,3 +79,36 @@ func DistanceFromHigh(currentPrice, high24h float64) float64 {
 	}
 	return (high24h - currentPrice) / high24h
 }
+
+// SMA calculates Simple Moving Average for a slice of float64 values
+// Returns 0 if the slice is empty
+// v1.8.0: Added for MA Extension Filter
+func SMA(values []float64) float64 {
+	return Mean(values) // SMA is just the arithmetic mean
+}
+
+// SMAFromPrices calculates SMA from closing prices
+// Takes a slice of closing prices and returns SMA
+// v1.8.0: Helper for calculating SMA from candle data
+func SMAFromPrices(closePrices []float64, window int) float64 {
+	if len(closePrices) == 0 {
+		return 0
+	}
+	// Use up to 'window' most recent prices
+	start := 0
+	if len(closePrices) > window {
+		start = len(closePrices) - window
+	}
+	return SMA(closePrices[start:])
+}
+
+// CalculateDeviation calculates percentage deviation of current price from SMA
+// Returns positive value if price is below SMA (e.g., 0.04 = 4% below)
+// Returns negative value if price is above SMA
+// v1.8.0: For MA Extension Filter (rubber band effect)
+func CalculateDeviation(currentPrice, sma float64) float64 {
+	if sma <= 0 {
+		return 0
+	}
+	return (sma - currentPrice) / sma
+}
