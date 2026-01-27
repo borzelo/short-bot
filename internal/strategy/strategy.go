@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/islamtagirov/millionaire-bot/internal/models"
@@ -82,7 +83,50 @@ type Engine struct {
 	oiSnapshots    map[string]*models.OISnapshot     // v1.5.0: symbol -> OI snapshot for delta calc
 	signalChan     chan *models.Signal
 	lastSignal     map[string]time.Time              // symbol -> last signal time (cooldown)
+	filterStats    *FilterStats                      // v1.8.1: Pipeline statistics for diagnostics
 }
+
+// FilterStats tracks rejection statistics for pipeline diagnostics (v1.8.1)
+// Uses atomic counters for lock-free performance
+type FilterStats struct {
+	CandlesProcessed int64 // Total candles that entered analyzeBreakdown
+
+	// Filter rejection counters (ordered by pipeline position)
+	RejectedVolatility    int64 // Filter 1: NDR < 3%
+	RejectedOversold24h   int64 // Filter 2: Price24h < -15%
+	RejectedMaxPump       int64 // Filter 3: Price24h > 30%
+	RejectedSmartPumpNear int64 // Filter 4: Pump > 15% but near high
+	RejectedMAExtension   int64 // Filter 5: >4% below SMA200
+	RejectedOILongExit    int64 // Filter 6: Price down + OI down
+	RejectedRSWeak        int64 // Filter 7: RS >= -3%
+	RejectedFunding       int64 // Filter 8: Funding < -0.015%
+	RejectedVolume        int64 // Filter 9: Volume < 1.5x
+	RejectedClosePosition int64 // Filter 10: Close > 30% of range
+	RejectedNoSupport     int64 // Filter 11: No support found
+	RejectedSupportAge    int64 // Filter 12: Support too young
+	RejectedNoBreakdown   int64 // Close >= Support
+	RejectedBounceback    int64 // Wick recovery detected
+	RejectedLowScore      int64 // Score < 50
+	RejectedCooldown      int64 // 15 min cooldown active
+
+	SignalsGenerated int64 // Successfully emitted signals
+
+	// Near-miss tracking (score 40-49)
+	nearMissMu     sync.Mutex
+	NearMissSignals []NearMissSignal
+}
+
+// NearMissSignal represents a signal that almost passed (score 40-49)
+type NearMissSignal struct {
+	Symbol    string
+	Score     int
+	RS        float64
+	VolumeZ   float64
+	Timestamp time.Time
+}
+
+// MaxNearMissSignals limits memory usage for near-miss tracking
+const MaxNearMissSignals = 10
 
 // RingBuffer is a memory-efficient circular buffer for candles
 type RingBuffer struct {
@@ -167,6 +211,7 @@ func NewEngine() *Engine {
 		oiSnapshots:    make(map[string]*models.OISnapshot), // v1.5.0
 		signalChan:     make(chan *models.Signal, 100),
 		lastSignal:     make(map[string]time.Time),
+		filterStats:    &FilterStats{}, // v1.8.1: Pipeline statistics
 	}
 }
 
@@ -222,10 +267,9 @@ func (e *Engine) emitSignal(signal *models.Signal) {
 	// Check cooldown
 	if lastTime, exists := e.lastSignal[signal.Symbol]; exists {
 		if time.Since(lastTime).Minutes() < SignalCooldownMins {
-			log.Debug().
-				Str("symbol", signal.Symbol).
-				Float64("minutes_since_last", time.Since(lastTime).Minutes()).
-				Msg("signal skipped due to cooldown")
+			if e.filterStats != nil {
+				atomic.AddInt64(&e.filterStats.RejectedCooldown, 1)
+			}
 			return
 		}
 	}
@@ -233,6 +277,9 @@ func (e *Engine) emitSignal(signal *models.Signal) {
 	select {
 	case e.signalChan <- signal:
 		e.lastSignal[signal.Symbol] = time.Now()
+		if e.filterStats != nil {
+			atomic.AddInt64(&e.filterStats.SignalsGenerated, 1)
+		}
 		log.Info().
 			Str("symbol", signal.Symbol).
 			Int("score", signal.ScoreTotal).
@@ -251,6 +298,15 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		return nil
 	}
 
+	// v1.8.1: Ensure filterStats is initialized (defensive programming)
+	// This should never happen if Engine is created via NewEngine()
+	if e.filterStats == nil {
+		e.filterStats = &FilterStats{}
+	}
+
+	// Increment candles processed counter
+	atomic.AddInt64(&e.filterStats.CandlesProcessed, 1)
+
 	currentCandle := buffer.Last()
 
 	// Pre-calculate distFromHigh once (used in multiple places)
@@ -268,33 +324,21 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		dailyRange := ticker24h.HighPrice24h - ticker24h.LowPrice24h
 		volatility := dailyRange / ticker24h.LastPrice
 		if volatility < MinVolatility24h {
-			log.Debug().
-				Str("symbol", symbol).
-				Float64("volatility", volatility).
-				Float64("threshold", MinVolatility24h).
-				Msg("signal rejected: volatility too low (dead coin)")
+			atomic.AddInt64(&e.filterStats.RejectedVolatility, 1)
 			return nil // REJECT: Asset is too stable/dead, not worth trading fees
 		}
 
 		// v1.8.0: Oversold Filter (24h Fatigue) - prevent shorting crashed assets
 		// If asset already dropped >15% in 24h, it's likely oversold - bear trap risk
 		if ticker24h.Price24hPcnt < OversoldThreshold24h {
-			log.Debug().
-				Str("symbol", symbol).
-				Float64("price_change_24h_pct", ticker24h.Price24hPcnt*100).
-				Float64("threshold_pct", OversoldThreshold24h*100).
-				Msg("signal rejected: asset oversold (already crashed >15% in 24h)")
+			atomic.AddInt64(&e.filterStats.RejectedOversold24h, 1)
 			return nil
 		}
 
 		// v1.5.0: Smart Pump Filter (replaces simple MaxPriceGain24h filter)
 		// Allow assets up to 30% gain, but apply smart filtering
 		if ticker24h.Price24hPcnt > MaxPriceGain24h {
-			log.Debug().
-				Str("symbol", symbol).
-				Float64("price_change_24h", ticker24h.Price24hPcnt*100).
-				Float64("max_allowed", MaxPriceGain24h*100).
-				Msg("signal rejected: asset pumping too hard (>30%), risky to short")
+			atomic.AddInt64(&e.filterStats.RejectedMaxPump, 1)
 			return nil
 		}
 
@@ -302,11 +346,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		if ticker24h.Price24hPcnt > SmartPumpThreshold && ticker24h.HighPrice24h > 0 {
 			// BLOCK: If pump > 15% AND price still near high (< 3% drop) - knife catching
 			if distFromHigh < SmartPumpNearHighDist {
-				log.Debug().
-					Str("symbol", symbol).
-					Float64("price_change_24h_pct", ticker24h.Price24hPcnt*100).
-					Float64("dist_from_high_pct", distFromHigh*100).
-					Msg("signal BLOCKED: pump > 15% but price still near high (knife catching)")
+				atomic.AddInt64(&e.filterStats.RejectedSmartPumpNear, 1)
 				return nil
 			}
 		}
@@ -318,13 +358,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	if smaAvailable {
 		deviation := utils.CalculateDeviation(currentCandle.Close, sma200)
 		if deviation > MAExtensionThreshold {
-			log.Debug().
-				Str("symbol", symbol).
-				Float64("current_price", currentCandle.Close).
-				Float64("sma200", sma200).
-				Float64("deviation_pct", deviation*100).
-				Float64("threshold_pct", MAExtensionThreshold*100).
-				Msg("signal rejected: price extended from SMA200 (rubber band risk)")
+			atomic.AddInt64(&e.filterStats.RejectedMAExtension, 1)
 			return nil
 		}
 	}
@@ -332,28 +366,27 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	// v1.5.0: Calculate OI divergence early for potential block
 	deltaOI, isAggressiveShort, isLongExit := e.calculateOIDivergence(symbol, currentCandle)
 	if isLongExit {
-		log.Debug().
-			Str("symbol", symbol).
-			Float64("delta_oi_pct", deltaOI*100).
-			Msg("signal BLOCKED: price down + OI down = long exit (not short opportunity)")
+		atomic.AddInt64(&e.filterStats.RejectedOILongExit, 1)
 		return nil
 	}
 
 	// 1. Calculate Relative Strength (RS)
 	rs, err := e.calculateRS(symbol)
 	if err != nil {
-		log.Debug().Err(err).Str("symbol", symbol).Msg("RS calculation failed")
+		atomic.AddInt64(&e.filterStats.RejectedRSWeak, 1)
 		return nil
 	}
 
 	// Check weakness threshold
 	if rs >= RSWeakThreshold {
+		atomic.AddInt64(&e.filterStats.RejectedRSWeak, 1)
 		return nil
 	}
 
 	// 2. Check funding rate (anti-squeeze filter)
 	fundingRate := e.fundingRates[symbol]
 	if fundingRate < FundingAntiSqueeze {
+		atomic.AddInt64(&e.filterStats.RejectedFunding, 1)
 		return nil
 	}
 
@@ -367,6 +400,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	// 4. Check volume threshold early
 	if volumeRatio < VolumeMinRatio {
+		atomic.AddInt64(&e.filterStats.RejectedVolume, 1)
 		return nil
 	}
 
@@ -377,6 +411,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	}
 	closePosition := (currentCandle.Close - currentCandle.Low) / candleRange
 	if closePosition > ClosePositionMax {
+		atomic.AddInt64(&e.filterStats.RejectedClosePosition, 1)
 		return nil
 	}
 
@@ -384,6 +419,7 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 	candles := buffer.LastN(buffer.Len())
 	support := DetectSupport(candles)
 	if support == nil {
+		atomic.AddInt64(&e.filterStats.RejectedNoSupport, 1)
 		return nil
 	}
 
@@ -398,34 +434,22 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 		// High volatility detected - asset dropped >2% in last hour
 		// Require older support levels (45 min) to avoid temporary pauses
 		minSupportAge = HighVolatilitySupportAge
-		log.Debug().
-			Str("symbol", symbol).
-			Float64("change_1h_pct", change1h*100).
-			Float64("adjusted_min_age", minSupportAge).
-			Msg("high volatility: increased minimum support age")
 	}
 
 	if supportAgeMinutes < minSupportAge {
-		log.Debug().
-			Str("symbol", symbol).
-			Float64("support_age_min", supportAgeMinutes).
-			Float64("min_required", minSupportAge).
-			Float64("change_1h_pct", change1h*100).
-			Msg("signal rejected: support level too young")
+		atomic.AddInt64(&e.filterStats.RejectedSupportAge, 1)
 		return nil
 	}
 
 	// 7. Check breakdown condition: Close < Support
 	if currentCandle.Close >= support.Price {
+		atomic.AddInt64(&e.filterStats.RejectedNoBreakdown, 1)
 		return nil
 	}
 
 	// 8. Confirm no bounceback (v1.4.0)
 	if !ConfirmNoBounceback(candles, support.Price) {
-		log.Debug().
-			Str("symbol", symbol).
-			Float64("support", support.Price).
-			Msg("bounceback detected, skipping signal")
+		atomic.AddInt64(&e.filterStats.RejectedBounceback, 1)
 		return nil
 	}
 
@@ -452,14 +476,11 @@ func (e *Engine) analyzeBreakdown(symbol string) *models.Signal {
 
 	// Check minimum score threshold
 	if score < MinScoreForSignal {
-		log.Debug().
-			Str("symbol", symbol).
-			Int("score", score).
-			Float64("rs", rs).
-			Float64("volume_ratio", volumeRatio).
-			Float64("volume_z_score", volumeZScore).
-			Float64("delta_oi", deltaOI).
-			Msg("signal score too low, discarded")
+		atomic.AddInt64(&e.filterStats.RejectedLowScore, 1)
+		// v1.8.1: Track near-miss signals (score 40-49) for diagnostics
+		if score >= 40 {
+			e.recordNearMiss(symbol, score, rs, volumeZScore)
+		}
 		return nil
 	}
 
@@ -984,6 +1005,121 @@ func (e *Engine) GetStats() map[string]interface{} {
 		"oi_snapshots":    len(e.oiSnapshots),
 		"last_signals":    len(e.lastSignal),
 	}
+}
+
+// recordNearMiss saves a near-miss signal (score 40-49) for diagnostics (v1.8.1)
+func (e *Engine) recordNearMiss(symbol string, score int, rs float64, volumeZ float64) {
+	if e.filterStats == nil {
+		return // Safety check
+	}
+
+	e.filterStats.nearMissMu.Lock()
+	defer e.filterStats.nearMissMu.Unlock()
+
+	// Limit memory usage - use copy to avoid memory leak from slice re-slicing
+	// (re-slicing keeps underlying array allocated)
+	if len(e.filterStats.NearMissSignals) >= MaxNearMissSignals {
+		// Shift elements left and reuse underlying array
+		copy(e.filterStats.NearMissSignals, e.filterStats.NearMissSignals[1:])
+		e.filterStats.NearMissSignals = e.filterStats.NearMissSignals[:MaxNearMissSignals-1]
+	}
+
+	e.filterStats.NearMissSignals = append(e.filterStats.NearMissSignals, NearMissSignal{
+		Symbol:    symbol,
+		Score:     score,
+		RS:        rs,
+		VolumeZ:   volumeZ,
+		Timestamp: time.Now(),
+	})
+}
+
+// GetFilterStats returns a snapshot of filter statistics (v1.8.1)
+// Returns aggregated rejection counts and near-miss signals
+// Thread-safe: takes mutex to ensure consistent snapshot
+func (e *Engine) GetFilterStats() map[string]interface{} {
+	if e.filterStats == nil {
+		return map[string]interface{}{} // Safety check
+	}
+
+	// Lock near-miss mutex FIRST to ensure consistent snapshot
+	// (atomic counters are read atomically, but we need consistency with near-miss)
+	e.filterStats.nearMissMu.Lock()
+	defer e.filterStats.nearMissMu.Unlock()
+
+	// Copy near-miss signals while holding lock
+	nearMiss := make([]map[string]interface{}, 0, len(e.filterStats.NearMissSignals))
+	for _, nm := range e.filterStats.NearMissSignals {
+		nearMiss = append(nearMiss, map[string]interface{}{
+			"symbol":   nm.Symbol,
+			"score":    nm.Score,
+			"rs":       nm.RS,
+			"volume_z": nm.VolumeZ,
+		})
+	}
+
+	// Read atomic counters (lock-free, but done after near-miss copy for logical consistency)
+	stats := map[string]interface{}{
+		"candles_processed": atomic.LoadInt64(&e.filterStats.CandlesProcessed),
+		"signals_generated": atomic.LoadInt64(&e.filterStats.SignalsGenerated),
+		"rejections": map[string]int64{
+			"volatility":      atomic.LoadInt64(&e.filterStats.RejectedVolatility),
+			"oversold_24h":    atomic.LoadInt64(&e.filterStats.RejectedOversold24h),
+			"max_pump":        atomic.LoadInt64(&e.filterStats.RejectedMaxPump),
+			"smart_pump_near": atomic.LoadInt64(&e.filterStats.RejectedSmartPumpNear),
+			"ma_extension":    atomic.LoadInt64(&e.filterStats.RejectedMAExtension),
+			"oi_long_exit":    atomic.LoadInt64(&e.filterStats.RejectedOILongExit),
+			"rs_weak":         atomic.LoadInt64(&e.filterStats.RejectedRSWeak),
+			"funding":         atomic.LoadInt64(&e.filterStats.RejectedFunding),
+			"volume":          atomic.LoadInt64(&e.filterStats.RejectedVolume),
+			"close_position":  atomic.LoadInt64(&e.filterStats.RejectedClosePosition),
+			"no_support":      atomic.LoadInt64(&e.filterStats.RejectedNoSupport),
+			"support_age":     atomic.LoadInt64(&e.filterStats.RejectedSupportAge),
+			"no_breakdown":    atomic.LoadInt64(&e.filterStats.RejectedNoBreakdown),
+			"bounceback":      atomic.LoadInt64(&e.filterStats.RejectedBounceback),
+			"low_score":       atomic.LoadInt64(&e.filterStats.RejectedLowScore),
+			"cooldown":        atomic.LoadInt64(&e.filterStats.RejectedCooldown),
+		},
+		"near_miss":       nearMiss,
+		"near_miss_count": len(nearMiss),
+	}
+
+	return stats
+}
+
+// ResetFilterStats clears all counters for the next period (v1.8.1)
+// Thread-safe: uses atomic stores and mutex for near-miss
+func (e *Engine) ResetFilterStats() {
+	if e.filterStats == nil {
+		return // Safety check
+	}
+
+	// Lock near-miss mutex FIRST (same order as GetFilterStats to prevent deadlock)
+	e.filterStats.nearMissMu.Lock()
+	
+	// Reset atomic counters while holding lock (ensures consistency with GetFilterStats)
+	atomic.StoreInt64(&e.filterStats.CandlesProcessed, 0)
+	atomic.StoreInt64(&e.filterStats.SignalsGenerated, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedVolatility, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedOversold24h, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedMaxPump, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedSmartPumpNear, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedMAExtension, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedOILongExit, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedRSWeak, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedFunding, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedVolume, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedClosePosition, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedNoSupport, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedSupportAge, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedNoBreakdown, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedBounceback, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedLowScore, 0)
+	atomic.StoreInt64(&e.filterStats.RejectedCooldown, 0)
+
+	// Clear near-miss signals (reuse underlying array to avoid allocation)
+	e.filterStats.NearMissSignals = e.filterStats.NearMissSignals[:0]
+	
+	e.filterStats.nearMissMu.Unlock()
 }
 
 // CleanupInactiveSymbols removes data for symbols that are no longer actively tracked

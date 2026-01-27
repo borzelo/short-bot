@@ -29,7 +29,7 @@ const (
 func main() {
 	setupLogger()
 
-	log.Info().Msg("🚀 Starting Millionaire Bot v1.8.0")
+	log.Info().Msg("🚀 Starting Millionaire Bot v1.8.1")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -272,8 +272,17 @@ func runPeriodicTasks(ctx context.Context, engine *strategy.Engine, updateTicker
 		case <-ctx.Done():
 			return
 		case <-statsTicker.C:
+			// v1.8.1: Enhanced statistics with filter rejection details
 			stats := engine.GetStats()
-			log.Info().Interface("stats", stats).Msg("engine statistics")
+			filterStats := engine.GetFilterStats()
+			
+			log.Info().
+				Interface("engine", stats).
+				Interface("pipeline", filterStats).
+				Msg("📊 engine statistics (5 min period)")
+			
+			// Reset counters for next period
+			engine.ResetFilterStats()
 		case <-tickerDataTicker.C:
 			updateTickerData()
 		case <-weaknessTicker.C:
