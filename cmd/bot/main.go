@@ -22,12 +22,14 @@ const (
 	MinTurnoverUSD = 5_000_000 // $5M/24h minimum
 	// v1.4.0: Number of weak assets to monitor
 	TopWeakCount = 50
+	// v1.6.0: Max inactive time before unsubscribing from symbol
+	MaxInactiveTime = 2 * time.Hour
 )
 
 func main() {
 	setupLogger()
 
-	log.Info().Msg("🚀 Starting Millionaire Bot v1.5.1")
+	log.Info().Msg("🚀 Starting Millionaire Bot v1.6.0")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -93,9 +95,27 @@ func main() {
 	// Initialize strategy engine
 	engine := strategy.NewEngine()
 
+	// Initialize Telegram notifier (moved up to allow wsClient reference in updateTickerData)
+	notifier := telegram.NewNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
+
+	// Initialize and connect WebSocket client (handles reconnection internally)
+	wsClient := bybit.NewWSClient(cfg.ByBitWSURL, symbols)
+	if err := wsClient.Connect(ctx); err != nil {
+		log.Fatal().Err(err).Msg("failed to connect to WebSocket")
+	}
+	defer wsClient.Close()
+
 	// Combined ticker data updater (v1.3.0: single API call for funding + 24h stats)
+	// v1.6.0: Now uses dynamic symbol list from wsClient
 	updateTickerData := func() {
-		data, err := apiClient.GetTickerData(symbols)
+		// Get current subscribed symbols (dynamic, not static!)
+		currentSymbols := wsClient.GetSubscribedSymbols()
+		if len(currentSymbols) == 0 {
+			log.Warn().Msg("no symbols subscribed, skipping ticker data update")
+			return
+		}
+
+		data, err := apiClient.GetTickerData(currentSymbols)
 		if err != nil {
 			log.Warn().Err(err).Msg("failed to fetch ticker data")
 			return
@@ -111,16 +131,6 @@ func main() {
 	// Fetch ticker data at startup
 	updateTickerData()
 
-	// Initialize Telegram notifier
-	notifier := telegram.NewNotifier(cfg.TelegramBotToken, cfg.TelegramChatID)
-
-	// Initialize and connect WebSocket client (handles reconnection internally)
-	wsClient := bybit.NewWSClient(cfg.ByBitWSURL, symbols)
-	if err := wsClient.Connect(ctx); err != nil {
-		log.Fatal().Err(err).Msg("failed to connect to WebSocket")
-	}
-	defer wsClient.Close()
-
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -129,14 +139,31 @@ func main() {
 	go processCandles(ctx, engine, wsClient)
 	go processSignals(ctx, engine, store, notifier)
 
-	// v1.4.0: Weakness scanner update function (hourly)
+	// v1.6.0: Weakness scanner update function with dynamic subscriptions
 	updateWeaknessScores := func() {
 		log.Info().Msg("updating weakness scores...")
 		if err := weaknessScanner.ScanAll(allSymbols); err != nil {
 			log.Warn().Err(err).Msg("weakness scan update failed")
+			return
 		}
-		// Note: Dynamic WebSocket subscription update not implemented yet
-		// This requires changes to WSClient to support UpdateSubscriptions()
+
+		// Get new top weak symbols
+		weakScores := weaknessScanner.GetTopWeak(TopWeakCount)
+		newSymbols := strategy.GetSymbolsFromScores(weakScores)
+		newSymbols = ensureBTCIncluded(newSymbols)
+
+		// Add new subscriptions dynamically
+		if err := wsClient.AddSubscriptions(newSymbols); err != nil {
+			log.Warn().Err(err).Msg("failed to add new subscriptions")
+		}
+
+		// Cleanup inactive subscriptions (symbols not in top weak for 2+ hours)
+		if cleaned := wsClient.CleanupInactive(MaxInactiveTime); cleaned > 0 {
+			log.Info().
+				Int("cleaned", cleaned).
+				Int("active", wsClient.GetSubscribedCount()).
+				Msg("cleaned up inactive subscriptions")
+		}
 	}
 
 	// Start periodic tasks

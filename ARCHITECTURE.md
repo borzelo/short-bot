@@ -892,6 +892,63 @@ log.Info().Msg("👋 Bot stopped")
 
 ## История изменений
 
+### v1.6.0 (27 января 2026) — Dynamic WebSocket Subscriptions
+
+**Проблема:** WebSocket подписки фиксировались при старте бота и не обновлялись при пересчёте weakness scores. Новые слабые активы не попадали в мониторинг до перезапуска.
+
+**Решение:** Динамическое добавление/удаление WebSocket подписок.
+
+**Новые методы WSClient:**
+```go
+// Подписка на новые символы (игнорирует уже подписанные)
+func (c *WSClient) AddSubscriptions(symbols []string) error
+
+// Количество активных подписок
+func (c *WSClient) GetSubscribedCount() int
+
+// Отписка от неактивных символов (не были в топ слабых > maxInactiveTime)
+func (c *WSClient) CleanupInactive(maxInactiveTime time.Duration) int
+```
+
+**Новые структуры данных в WSClient:**
+```go
+subscribedSymbols map[string]struct{}  // Set подписанных символов
+lastActive        map[string]time.Time // Время последнего появления в топ слабых
+subMu             sync.RWMutex         // Mutex для thread-safety
+```
+
+**Логика работы:**
+1. При обновлении weakness scores (каждые 15 мин) вызывается `AddSubscriptions()`
+2. Новые символы добавляются в подписки, `lastActive` обновляется для всех
+3. `CleanupInactive(2h)` отписывает символы, не появлявшиеся в топе > 2 часов
+4. BTCUSDT никогда не удаляется (нужен для RS)
+5. При reconnect подписываемся на ВСЕ символы из `subscribedSymbols`
+
+**Константы:**
+```go
+MaxInactiveTime      = 2 * time.Hour  // Время до отписки неактивного символа
+maxSubscriptionsWarn = 200            // Soft limit для предупреждения
+```
+
+**Преимущества:**
+- ✅ Новые слабые активы сразу попадают в мониторинг
+- ✅ RingBuffer сохраняется при временном выходе из топа
+- ✅ Предотвращение неограниченного роста подписок
+- ✅ Thread-safe операции
+- ✅ Корректный reconnect со всеми подписками
+
+**Критические исправления (v1.6.0 bugfix):**
+
+1. **Race Condition Fix**: Добавлен отдельный `writeMu sync.Mutex` для всех операций записи в WebSocket. Gorilla WebSocket не потокобезопасен для записи — одновременные ping, subscribe и unsubscribe вызывали data corruption.
+
+2. **Dynamic Ticker Data**: `updateTickerData()` теперь использует `wsClient.GetSubscribedSymbols()` вместо статического списка. Ранее новые символы не получали funding rates и 24h stats.
+
+3. **Rollback on Error**: `AddSubscriptions()` теперь откатывает добавленные символы из map при ошибке подписки, предотвращая inconsistent state.
+
+4. **Новый метод `GetSubscribedSymbols()`**: Возвращает копию списка подписанных символов для использования в других компонентах.
+
+---
+
 ### v1.5.1 (26 января 2026) — Faster Weakness Scanner
 
 **Проблема:** WeaknessScanner обновлялся раз в час. В крипте за час монета может упасть на 20% и отскочить — слишком медленно.
@@ -1182,6 +1239,6 @@ MaxPriceGain24h      = 0.10  // Макс. рост за 24ч для шорта
 
 ---
 
-**Документация актуальна на**: 26 января 2026
-**Версия бота**: 1.5.1
+**Документация актуальна на**: 27 января 2026
+**Версия бота**: 1.6.0
 **Автор архитектуры**: AI-assisted development

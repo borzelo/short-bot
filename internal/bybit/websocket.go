@@ -17,14 +17,20 @@ import (
 // WSClient handles WebSocket connection to ByBit with auto-reconnect
 type WSClient struct {
 	url        string
-	symbols    []string
+	symbols    []string // Initial symbols (kept for backwards compatibility)
 	conn       *websocket.Conn
 	mu         sync.RWMutex
+	writeMu    sync.Mutex // Separate mutex for WebSocket writes (gorilla/websocket is not thread-safe for writes)
 	candleChan chan models.Candle
 	ctx        context.Context
 	cancel     context.CancelFunc
 	connected  atomic.Bool
 	wg         sync.WaitGroup
+
+	// Dynamic subscription tracking (v1.6.0)
+	subscribedSymbols map[string]struct{}  // Set of currently subscribed symbols
+	lastActive        map[string]time.Time // When symbol was last in top weak list
+	subMu             sync.RWMutex         // Mutex for subscription maps
 }
 
 type wsSubscription struct {
@@ -56,13 +62,28 @@ const (
 	maxReconnectDelay    = 60 * time.Second
 	pingInterval         = 20 * time.Second
 	readDeadline         = 60 * time.Second
+	subscriptionBatchSize = 10                  // ByBit allows max 10 subscriptions per request
+	batchDelay            = 100 * time.Millisecond
+	maxSubscriptionsWarn  = 200                 // Soft limit for warning
 )
 
 func NewWSClient(url string, symbols []string) *WSClient {
+	// Initialize subscription tracking with initial symbols
+	subscribedSymbols := make(map[string]struct{}, len(symbols))
+	lastActive := make(map[string]time.Time, len(symbols))
+	now := time.Now()
+
+	for _, sym := range symbols {
+		subscribedSymbols[sym] = struct{}{}
+		lastActive[sym] = now
+	}
+
 	return &WSClient{
-		url:        url,
-		symbols:    symbols,
-		candleChan: make(chan models.Candle, 1000),
+		url:               url,
+		symbols:           symbols,
+		candleChan:        make(chan models.Candle, 1000),
+		subscribedSymbols: subscribedSymbols,
+		lastActive:        lastActive,
 	}
 }
 
@@ -169,15 +190,26 @@ func (c *WSClient) subscribe() error {
 		return fmt.Errorf("connection not established")
 	}
 
-	// ByBit allows max 10 subscriptions per request
-	const batchSize = 10
-	for i := 0; i < len(c.symbols); i += batchSize {
-		end := i + batchSize
-		if end > len(c.symbols) {
-			end = len(c.symbols)
+	// Get all currently tracked symbols (important for reconnect!)
+	c.subMu.RLock()
+	symbols := make([]string, 0, len(c.subscribedSymbols))
+	for sym := range c.subscribedSymbols {
+		symbols = append(symbols, sym)
+	}
+	c.subMu.RUnlock()
+
+	if len(symbols) == 0 {
+		log.Warn().Msg("no symbols to subscribe to")
+		return nil
+	}
+
+	for i := 0; i < len(symbols); i += subscriptionBatchSize {
+		end := i + subscriptionBatchSize
+		if end > len(symbols) {
+			end = len(symbols)
 		}
 
-		batch := c.symbols[i:end]
+		batch := symbols[i:end]
 		topics := make([]string, len(batch))
 		for j, symbol := range batch {
 			topics[j] = fmt.Sprintf("kline.1.%s", symbol)
@@ -188,20 +220,25 @@ func (c *WSClient) subscribe() error {
 			Args: topics,
 		}
 
-		if err := conn.WriteJSON(sub); err != nil {
+		// Use writeMu to prevent concurrent writes
+		c.writeMu.Lock()
+		err := conn.WriteJSON(sub)
+		c.writeMu.Unlock()
+
+		if err != nil {
 			return fmt.Errorf("write subscription: %w", err)
 		}
 
 		log.Info().
-			Int("batch_num", i/batchSize+1).
+			Int("batch_num", i/subscriptionBatchSize+1).
 			Int("symbols_count", len(batch)).
 			Msg("subscribed to kline batch")
 
 		// Small delay between batches to avoid rate limiting
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(batchDelay)
 	}
 
-	log.Info().Int("total_symbols", len(c.symbols)).Msg("all subscriptions completed")
+	log.Info().Int("total_symbols", len(symbols)).Msg("all subscriptions completed")
 	return nil
 }
 
@@ -228,7 +265,12 @@ func (c *WSClient) pingRoutine() {
 				continue
 			}
 
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			// Use writeMu to prevent concurrent writes (gorilla/websocket is not thread-safe)
+			c.writeMu.Lock()
+			err := conn.WriteMessage(websocket.PingMessage, nil)
+			c.writeMu.Unlock()
+
+			if err != nil {
 				log.Warn().Err(err).Msg("ping failed")
 				// Don't trigger reconnect here, readRoutine will handle it
 			}
@@ -398,13 +440,18 @@ func validateCandle(c models.Candle) error {
 
 func (c *WSClient) closeConnection() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
 
-	if c.conn != nil {
+	if conn != nil {
+		// Use writeMu for the close message write
+		c.writeMu.Lock()
 		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-		c.conn.WriteMessage(websocket.CloseMessage, closeMsg)
-		c.conn.Close()
-		c.conn = nil
+		conn.WriteMessage(websocket.CloseMessage, closeMsg)
+		c.writeMu.Unlock()
+
+		conn.Close()
 	}
 }
 
@@ -432,4 +479,235 @@ func (c *WSClient) Close() {
 	}
 
 	c.closeConnection()
+}
+
+// AddSubscriptions subscribes to new symbols (ignores already subscribed)
+// This method is thread-safe and can be called from any goroutine
+func (c *WSClient) AddSubscriptions(symbols []string) error {
+	if !c.connected.Load() {
+		return fmt.Errorf("not connected")
+	}
+
+	now := time.Now()
+
+	// Filter new symbols and update lastActive for all
+	c.subMu.Lock()
+	var newSymbols []string
+	for _, sym := range symbols {
+		// Update lastActive for all symbols (even already subscribed)
+		c.lastActive[sym] = now
+
+		// Check if already subscribed
+		if _, exists := c.subscribedSymbols[sym]; !exists {
+			newSymbols = append(newSymbols, sym)
+			c.subscribedSymbols[sym] = struct{}{}
+		}
+	}
+
+	totalSubscribed := len(c.subscribedSymbols)
+	c.subMu.Unlock()
+
+	// Warn if approaching soft limit
+	if totalSubscribed > maxSubscriptionsWarn {
+		log.Warn().
+			Int("total_subscribed", totalSubscribed).
+			Int("soft_limit", maxSubscriptionsWarn).
+			Msg("subscription count exceeds soft limit")
+	}
+
+	// No new symbols to subscribe
+	if len(newSymbols) == 0 {
+		log.Debug().Msg("no new symbols to subscribe")
+		return nil
+	}
+
+	log.Info().
+		Int("new_symbols", len(newSymbols)).
+		Int("total_subscribed", totalSubscribed).
+		Msg("adding new WebSocket subscriptions")
+
+	// Subscribe to new symbols in batches
+	if err := c.subscribeToSymbols(newSymbols); err != nil {
+		// Rollback: remove symbols that failed to subscribe
+		c.subMu.Lock()
+		for _, sym := range newSymbols {
+			delete(c.subscribedSymbols, sym)
+			delete(c.lastActive, sym)
+		}
+		c.subMu.Unlock()
+		return err
+	}
+
+	return nil
+}
+
+// subscribeToSymbols sends subscription requests for given symbols in batches
+func (c *WSClient) subscribeToSymbols(symbols []string) error {
+	for i := 0; i < len(symbols); i += subscriptionBatchSize {
+		end := i + subscriptionBatchSize
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+
+		batch := symbols[i:end]
+		topics := make([]string, len(batch))
+		for j, symbol := range batch {
+			topics[j] = fmt.Sprintf("kline.1.%s", symbol)
+		}
+
+		sub := wsSubscription{
+			Op:   "subscribe",
+			Args: topics,
+		}
+
+		// Get connection with read lock
+		c.mu.RLock()
+		conn := c.conn
+		c.mu.RUnlock()
+
+		if conn == nil {
+			return fmt.Errorf("connection lost during subscription")
+		}
+
+		// Use writeMu to prevent concurrent writes
+		c.writeMu.Lock()
+		err := conn.WriteJSON(sub)
+		c.writeMu.Unlock()
+
+		if err != nil {
+			return fmt.Errorf("write subscription: %w", err)
+		}
+
+		log.Debug().
+			Int("batch_num", i/subscriptionBatchSize+1).
+			Int("symbols_count", len(batch)).
+			Strs("symbols", batch).
+			Msg("subscribed to new kline batch")
+
+		// Small delay between batches to avoid rate limiting
+		if end < len(symbols) {
+			time.Sleep(batchDelay)
+		}
+	}
+
+	return nil
+}
+
+// GetSubscribedCount returns the number of currently subscribed symbols
+func (c *WSClient) GetSubscribedCount() int {
+	c.subMu.RLock()
+	defer c.subMu.RUnlock()
+	return len(c.subscribedSymbols)
+}
+
+// GetSubscribedSymbols returns a copy of currently subscribed symbols
+// This is useful for fetching ticker data for all active symbols
+func (c *WSClient) GetSubscribedSymbols() []string {
+	c.subMu.RLock()
+	defer c.subMu.RUnlock()
+
+	symbols := make([]string, 0, len(c.subscribedSymbols))
+	for sym := range c.subscribedSymbols {
+		symbols = append(symbols, sym)
+	}
+	return symbols
+}
+
+// CleanupInactive unsubscribes from symbols that haven't been in top weak list
+// for longer than maxInactiveTime. Returns the number of removed subscriptions.
+// Note: BTCUSDT is never removed as it's required for RS calculation.
+func (c *WSClient) CleanupInactive(maxInactiveTime time.Duration) int {
+	if !c.connected.Load() {
+		return 0
+	}
+
+	now := time.Now()
+
+	// Find inactive symbols
+	c.subMu.Lock()
+	var toRemove []string
+	for sym, lastTime := range c.lastActive {
+		// Never remove BTCUSDT - required for RS calculation
+		if sym == "BTCUSDT" {
+			continue
+		}
+
+		if now.Sub(lastTime) > maxInactiveTime {
+			toRemove = append(toRemove, sym)
+		}
+	}
+
+	// Remove from tracking maps
+	for _, sym := range toRemove {
+		delete(c.subscribedSymbols, sym)
+		delete(c.lastActive, sym)
+	}
+	c.subMu.Unlock()
+
+	if len(toRemove) == 0 {
+		return 0
+	}
+
+	// Send unsubscribe requests
+	if err := c.unsubscribeFromSymbols(toRemove); err != nil {
+		log.Warn().Err(err).Int("count", len(toRemove)).Msg("failed to unsubscribe from inactive symbols")
+		// Continue anyway - symbols are already removed from tracking
+	}
+
+	log.Info().
+		Int("removed", len(toRemove)).
+		Dur("max_inactive", maxInactiveTime).
+		Msg("cleaned up inactive subscriptions")
+
+	return len(toRemove)
+}
+
+// unsubscribeFromSymbols sends unsubscribe requests for given symbols in batches
+func (c *WSClient) unsubscribeFromSymbols(symbols []string) error {
+	for i := 0; i < len(symbols); i += subscriptionBatchSize {
+		end := i + subscriptionBatchSize
+		if end > len(symbols) {
+			end = len(symbols)
+		}
+
+		batch := symbols[i:end]
+		topics := make([]string, len(batch))
+		for j, symbol := range batch {
+			topics[j] = fmt.Sprintf("kline.1.%s", symbol)
+		}
+
+		unsub := wsSubscription{
+			Op:   "unsubscribe",
+			Args: topics,
+		}
+
+		// Get connection with read lock
+		c.mu.RLock()
+		conn := c.conn
+		c.mu.RUnlock()
+
+		if conn == nil {
+			return fmt.Errorf("connection lost during unsubscription")
+		}
+
+		// Use writeMu to prevent concurrent writes
+		c.writeMu.Lock()
+		err := conn.WriteJSON(unsub)
+		c.writeMu.Unlock()
+
+		if err != nil {
+			return fmt.Errorf("write unsubscription: %w", err)
+		}
+
+		log.Debug().
+			Int("batch_num", i/subscriptionBatchSize+1).
+			Int("symbols_count", len(batch)).
+			Msg("unsubscribed from kline batch")
+
+		if end < len(symbols) {
+			time.Sleep(batchDelay)
+		}
+	}
+
+	return nil
 }
