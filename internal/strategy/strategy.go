@@ -26,7 +26,7 @@ const (
 const (
 	RSWeakThreshold     = -1.2  // Minimum RS to consider asset weak
 	RSVeryWeakThreshold = -5.0  // RS threshold for extra weakness points
-	VolumeMinRatio      = 1.5   // Minimum volume ratio for signal
+	VolumeMinRatio      = 1.8   // Minimum volume ratio for signal
 	VolumeMediumRatio   = 2.0   // Medium volume ratio for scoring
 	VolumeHighRatio     = 3.0   // High volume ratio for extra points
 	ClosePositionMax    = 0.3   // Maximum close position (bottom 30%)
@@ -64,10 +64,10 @@ const (
 	SmartPumpRolloverBonus = 20  // Bonus for confirmed pump rollover with volume
 
 	// v1.8.0: Anti-Bear-Trap Filters
-	OversoldThreshold24h       = -0.15 // -15% in 24h = asset already crashed, skip short
+	OversoldThreshold24h       = -0.25 // -25% in 24h = asset already crashed, skip short
 	HighVolatilityThreshold1h  = -0.02 // -2% in 1h = high volatility, need stronger support
 	HighVolatilitySupportAge   = 45.0  // 45 minutes min support age during high volatility
-	DefaultSupportAge          = 15.0  // 15 minutes min support age (normal conditions)
+	DefaultSupportAge          = 30.0  // 30 minutes min support age (normal conditions)
 	SMAWindow                  = 200   // 200 candles for SMA calculation
 	SMAMinCandles              = 60    // Minimum candles required for meaningful SMA (skip filter if less)
 	MAExtensionThreshold       = 0.04  // 4% below SMA200 = extended, skip short (rubber band)
