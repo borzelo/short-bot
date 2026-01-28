@@ -24,7 +24,7 @@ const (
 
 // Scoring thresholds
 const (
-	RSWeakThreshold     = -3.0  // Minimum RS to consider asset weak
+	RSWeakThreshold     = -1.2  // Minimum RS to consider asset weak
 	RSVeryWeakThreshold = -5.0  // RS threshold for extra weakness points
 	VolumeMinRatio      = 1.5   // Minimum volume ratio for signal
 	VolumeMediumRatio   = 2.0   // Medium volume ratio for scoring
