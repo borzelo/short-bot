@@ -54,7 +54,7 @@ const (
 	OILongExitPenalty     = -50  // Penalty: price down + OI down (longs exiting, not shorts)
 
 	// v1.5.0: Volume Z-Score (v1.7.1: now primary volume scoring method)
-	VolumeZScoreWindow    = 24  // 24 candles for Z-Score calculation
+	VolumeZScoreWindow    = 50  // 24 candles for Z-Score calculation
 	VolumeZScoreThreshold = 3.0 // Z-Score threshold for extreme anomaly (+30 total)
 
 	// v1.5.0: Smart Pump Filter
