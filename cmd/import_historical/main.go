@@ -613,6 +613,8 @@ func loadCSVFile(filename string) ([]CSVRow, error) {
 
 	// Read all rows
 	rows := []CSVRow{}
+	rowCount := 0
+	hasOutcomesCount := 0
 	for {
 		record, err := csvReader.Read()
 		if err == io.EOF {
@@ -628,7 +630,27 @@ func loadCSVFile(filename string) ([]CSVRow, error) {
 		}
 
 		rows = append(rows, row)
+		rowCount++
+
+		// Track how many rows have outcomes (debug)
+		if row.Price15mClose != nil {
+			hasOutcomesCount++
+		}
+
+		// Log first row with outcomes for debugging
+		if rowCount == 1 && row.Price15mClose != nil {
+			log.Debug().
+				Float64("price_15m_close", *row.Price15mClose).
+				Float64("price_60m_close", *row.Price60mClose).
+				Msg("first row with outcomes parsed")
+		}
 	}
+
+	log.Debug().
+		Int("total_rows", rowCount).
+		Int("rows_with_outcomes", hasOutcomesCount).
+		Float64("coverage_pct", float64(hasOutcomesCount)/float64(rowCount)*100).
+		Msg("CSV loaded")
 
 	return rows, nil
 }
@@ -669,30 +691,24 @@ func parseCSVRow(record []string) (CSVRow, error) {
 	row.VolumeUSD, _ = strconv.ParseFloat(record[11], 64)
 
 	// 15m outcomes (nullable)
-	if record[12] != "" && record[12] != "NaN" {
-		val, _ := strconv.ParseFloat(record[12], 64)
+	if val, err := parseNullableFloat(record[12]); err == nil {
 		row.Price15mMax = &val
 	}
-	if record[13] != "" && record[13] != "NaN" {
-		val, _ := strconv.ParseFloat(record[13], 64)
+	if val, err := parseNullableFloat(record[13]); err == nil {
 		row.Price15mMin = &val
 	}
-	if record[14] != "" && record[14] != "NaN" {
-		val, _ := strconv.ParseFloat(record[14], 64)
+	if val, err := parseNullableFloat(record[14]); err == nil {
 		row.Price15mClose = &val
 	}
 
 	// 60m outcomes (nullable)
-	if record[15] != "" && record[15] != "NaN" {
-		val, _ := strconv.ParseFloat(record[15], 64)
+	if val, err := parseNullableFloat(record[15]); err == nil {
 		row.Price60mMax = &val
 	}
-	if record[16] != "" && record[16] != "NaN" {
-		val, _ := strconv.ParseFloat(record[16], 64)
+	if val, err := parseNullableFloat(record[16]); err == nil {
 		row.Price60mMin = &val
 	}
-	if record[17] != "" && record[17] != "NaN" {
-		val, _ := strconv.ParseFloat(record[17], 64)
+	if val, err := parseNullableFloat(record[17]); err == nil {
 		row.Price60mClose = &val
 	}
 
@@ -828,4 +844,34 @@ func batchInsert(ctx context.Context, store *db.Store, batch []*models.TrainingD
 		}
 	}
 	return nil
+}
+
+// parseNullableFloat parses a string to float64, handling various null representations
+func parseNullableFloat(s string) (float64, error) {
+	// Trim whitespace
+	s = strings.TrimSpace(s)
+
+	// Check for empty or null-like values
+	if s == "" ||
+	   s == "NaN" ||
+	   s == "nan" ||
+	   s == "NAN" ||
+	   s == "null" ||
+	   s == "NULL" ||
+	   s == "None" {
+		return 0, fmt.Errorf("null value")
+	}
+
+	// Try to parse
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse float: %w", err)
+	}
+
+	// Check for NaN result
+	if math.IsNaN(val) || math.IsInf(val, 0) {
+		return 0, fmt.Errorf("invalid float value")
+	}
+
+	return val, nil
 }
