@@ -75,6 +75,40 @@ func (s *Store) migrate(ctx context.Context) error {
 			meta JSONB
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals(symbol, created_at DESC)`,
+		// v1.9.0: Training data table for ML model
+		`CREATE TABLE IF NOT EXISTS training_data (
+			id SERIAL PRIMARY KEY,
+			created_at TIMESTAMPTZ DEFAULT NOW(),
+			symbol VARCHAR(20) NOT NULL,
+
+			-- ENTRY POINT (T=0)
+			entry_price DECIMAL NOT NULL,
+			entry_support_level DECIMAL,
+
+			-- FEATURES (INPUTS) - What the model learns from
+			features JSONB NOT NULL,
+
+			-- RESULTS AFTER 15 MINUTES (OUTPUTS)
+			-- Filled by background worker after 15 min
+			price_15m_max DECIMAL,
+			price_15m_min DECIMAL,
+			price_15m_close DECIMAL,
+
+			-- RESULTS AFTER 60 MINUTES (OUTPUTS)
+			-- Filled by background worker after 60 min
+			price_60m_max DECIMAL,
+			price_60m_min DECIMAL,
+			price_60m_close DECIMAL,
+
+			-- META INFORMATION
+			is_shadow_mode BOOLEAN DEFAULT FALSE,
+			ml_prediction FLOAT DEFAULT NULL
+		)`,
+		// Index for finding pending rows (where worker needs to fill 60m results)
+		`CREATE INDEX IF NOT EXISTS idx_training_pending ON training_data(created_at)
+		 WHERE price_60m_close IS NULL`,
+		// Index for querying by symbol
+		`CREATE INDEX IF NOT EXISTS idx_training_symbol ON training_data(symbol, created_at DESC)`,
 	}
 
 	for _, migration := range migrations {
@@ -142,6 +176,80 @@ func (s *Store) SaveSignal(ctx context.Context, signal *models.Signal) error {
 		Int("score", signal.ScoreTotal).
 		Int("signal_id", signal.ID).
 		Msg("signal saved to database")
+
+	return nil
+}
+
+// SaveTrainingData saves a training data point for ML model (v1.9.0)
+// Captures ALL breakdown events regardless of quality filters
+func (s *Store) SaveTrainingData(ctx context.Context, data *models.TrainingData) error {
+	featuresJSON, err := json.Marshal(data.Features)
+	if err != nil {
+		return fmt.Errorf("marshal features: %w", err)
+	}
+
+	query := `
+		INSERT INTO training_data (
+			symbol, entry_price, entry_support_level, features, is_shadow_mode
+		)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, created_at
+	`
+
+	err = s.pool.QueryRow(ctx, query,
+		data.Symbol,
+		data.EntryPrice,
+		data.EntrySupportLevel,
+		featuresJSON,
+		data.IsShadowMode,
+	).Scan(&data.ID, &data.CreatedAt)
+
+	if err != nil {
+		return fmt.Errorf("save training data: %w", err)
+	}
+
+	shadowLabel := "real"
+	if data.IsShadowMode {
+		shadowLabel = "shadow"
+	}
+
+	log.Debug().
+		Str("symbol", data.Symbol).
+		Str("mode", shadowLabel).
+		Int("data_id", data.ID).
+		Msg("training data saved to database")
+
+	return nil
+}
+
+// UpdateTrainingOutcomes updates 15m/60m outcome fields for a training data row (v1.9.0)
+// Used when processing historical data where outcomes are known
+func (s *Store) UpdateTrainingOutcomes(ctx context.Context, id int, outcomes *models.TrainingOutcomes) error {
+	query := `
+		UPDATE training_data
+		SET
+			price_15m_max = $1,
+			price_15m_min = $2,
+			price_15m_close = $3,
+			price_60m_max = $4,
+			price_60m_min = $5,
+			price_60m_close = $6
+		WHERE id = $7
+	`
+
+	_, err := s.pool.Exec(ctx, query,
+		outcomes.Price15mMax,
+		outcomes.Price15mMin,
+		outcomes.Price15mClose,
+		outcomes.Price60mMax,
+		outcomes.Price60mMin,
+		outcomes.Price60mClose,
+		id,
+	)
+
+	if err != nil {
+		return fmt.Errorf("update training outcomes: %w", err)
+	}
 
 	return nil
 }

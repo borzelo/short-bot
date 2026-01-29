@@ -71,3 +71,45 @@ type OISnapshot struct {
 	OpenInterest float64
 	Timestamp    time.Time
 }
+
+// TrainingData represents a data point for ML model training (v1.9.0)
+// Captures ALL breakdown events (structure) regardless of quality filters
+type TrainingData struct {
+	ID        int
+	CreatedAt time.Time
+	Symbol    string
+
+	// ENTRY POINT (T=0)
+	EntryPrice         float64 // Price at detection moment
+	EntrySupportLevel  float64 // Support level that was broken
+
+	// FEATURES (INPUTS) - What the model learns from
+	// All indicators and filters calculated at T=0
+	Features map[string]interface{} // JSONB: RS, Volume, Funding, ATR, TimeOfDay, etc.
+
+	// RESULTS AFTER 15 MINUTES (OUTPUTS)
+	// Filled by background worker after 15 min
+	Price15mMax   *float64 // High in 15 min (for Stop-Loss check)
+	Price15mMin   *float64 // Low in 15 min (for Take-Profit check)
+	Price15mClose *float64 // Close price after 15 min
+
+	// RESULTS AFTER 60 MINUTES (OUTPUTS)
+	// Filled by background worker after 60 min
+	Price60mMax   *float64 // High in 60 min
+	Price60mMin   *float64 // Low in 60 min
+	Price60mClose *float64 // Close price after 60 min
+
+	// META INFORMATION
+	IsShadowMode  bool     // TRUE if this is a "soft" signal for learning (failed quality filters)
+	MLPrediction  *float64 // (Future) Model prediction if available
+}
+
+// TrainingOutcomes holds the 15m/60m price outcomes for a training data point (v1.9.0)
+type TrainingOutcomes struct {
+	Price15mMax   *float64
+	Price15mMin   *float64
+	Price15mClose *float64
+	Price60mMax   *float64
+	Price60mMin   *float64
+	Price60mClose *float64
+}
