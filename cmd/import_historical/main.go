@@ -343,7 +343,7 @@ func analyzeHistoricalBreakdown(
 
 	// PHASE 4: BUILD TRAINING DATA WITH OUTCOMES FROM CSV
 
-	return &models.TrainingData{
+	trainingData := &models.TrainingData{
 		Symbol:            symbol,
 		EntryPrice:        candle.Close,
 		EntrySupportLevel: support.Price,
@@ -356,6 +356,25 @@ func analyzeHistoricalBreakdown(
 		Price60mClose:     csvRow.Price60mClose,
 		IsShadowMode:      isShadowMode,
 	}
+
+	// Debug: Log first few breakdowns with outcomes
+	if csvRow.Price15mClose != nil {
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("entry_price", candle.Close).
+			Float64("price_15m_close", *csvRow.Price15mClose).
+			Float64("price_60m_close", *csvRow.Price60mClose).
+			Bool("has_outcomes", true).
+			Msg("breakdown with outcomes")
+	} else {
+		log.Debug().
+			Str("symbol", symbol).
+			Float64("entry_price", candle.Close).
+			Bool("has_outcomes", false).
+			Msg("breakdown WITHOUT outcomes")
+	}
+
+	return trainingData
 }
 
 func calculateFeaturesFromCSV(

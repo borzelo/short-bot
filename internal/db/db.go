@@ -190,9 +190,11 @@ func (s *Store) SaveTrainingData(ctx context.Context, data *models.TrainingData)
 
 	query := `
 		INSERT INTO training_data (
-			symbol, entry_price, entry_support_level, features, is_shadow_mode
+			symbol, entry_price, entry_support_level, features, is_shadow_mode,
+			price_15m_max, price_15m_min, price_15m_close,
+			price_60m_max, price_60m_min, price_60m_close
 		)
-		VALUES ($1, $2, $3, $4, $5)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, created_at
 	`
 
@@ -202,6 +204,12 @@ func (s *Store) SaveTrainingData(ctx context.Context, data *models.TrainingData)
 		data.EntrySupportLevel,
 		featuresJSON,
 		data.IsShadowMode,
+		data.Price15mMax,
+		data.Price15mMin,
+		data.Price15mClose,
+		data.Price60mMax,
+		data.Price60mMin,
+		data.Price60mClose,
 	).Scan(&data.ID, &data.CreatedAt)
 
 	if err != nil {

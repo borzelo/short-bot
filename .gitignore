@@ -1,5 +1,6 @@
 # Binaries (only in root, not cmd/bot folder)
 /bot
+/cmd/import_historical/import_historical
 *.exe
 *.exe~
 *.dll
